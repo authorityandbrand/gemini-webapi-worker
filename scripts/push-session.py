@@ -21,6 +21,7 @@ import os
 import subprocess
 import sys
 import time
+import traceback
 import urllib.request
 
 # ── Config ──────────────────────────────────────────────────────────────
@@ -34,25 +35,58 @@ AUTH_API_KEY = os.environ.get("AUTH_API_KEY", "")
 D1REST_SECRET = os.environ.get("D1REST_SECRET", "")
 
 
+COOKIE_NAMES = [
+    "__Secure-1PSID", "__Secure-1PSIDTS", "__Secure-1PAPISID",
+    "__Secure-1PSIDCC", "__Secure-3PSID", "__Secure-3PSIDTS",
+    "SID", "HSID", "SSID", "APISID", "SAPISID", "NID",
+    "SIDCC", "SNID",
+]
+
+
 def get_cookies_from_chrome():
-    """Extract Google cookies from local Chrome."""
+    """Extract Google cookies from local Chrome.
+
+    load_browser_cookies returns dict[str, list[dict]] where each cookie dict
+    has keys: name, value, domain, path, expires.  We flatten the list for the
+    target browser into a simple {name: value} mapping.
+    """
     from gemini_webapi.utils.load_browser_cookies import load_browser_cookies
 
     browser_cookies = load_browser_cookies(domain_name="google.com", verbose=False)
-    chrome = browser_cookies.get("chrome", {})
+
+    # Try chrome first, then fall back to any available browser
+    cookie_list = browser_cookies.get("chrome", [])
+    if not cookie_list:
+        for _browser, clist in browser_cookies.items():
+            if clist:
+                cookie_list = clist
+                break
+
+    # Flatten list[{name, value, ...}] -> {name: value}
+    flat = {c["name"]: c["value"] for c in cookie_list if "name" in c and "value" in c}
 
     cookies = {}
-    for name in [
-        "__Secure-1PSID", "__Secure-1PSIDTS", "__Secure-1PAPISID",
-        "__Secure-1PSIDCC", "__Secure-3PSID", "__Secure-3PSIDTS",
-        "SID", "HSID", "SSID", "APISID", "SAPISID", "NID",
-        "SIDCC", "SNID",
-    ]:
-        val = chrome.get(name, "")
+    for name in COOKIE_NAMES:
+        val = flat.get(name, "")
         if val:
             cookies[name] = val
 
     return cookies
+
+
+async def get_snlm0e(cookies):
+    """Init GeminiClient with extracted cookies and return the SNlM0e access token."""
+    from gemini_webapi import GeminiClient
+
+    psid = cookies.get("__Secure-1PSID", "")
+    psidts = cookies.get("__Secure-1PSIDTS", "")
+    client = GeminiClient(secure_1psid=psid, secure_1psidts=psidts)
+    # Inject all cookies so the token fetch succeeds
+    client.cookies = cookies
+    await client.init(timeout=30, auto_close=False, auto_refresh=False, verbose=False)
+    token = client.access_token
+    await client.close()
+    return token
 
 
 def http_post(url, data, auth_header=None):
@@ -96,7 +130,7 @@ def push_to_kv(key, value):
             ["npx", "wrangler", "kv", "key", "put", key, "--path", tmp,
              "--namespace-id", KV_NAMESPACE_ID, "--remote"],
             capture_output=True, text=True, timeout=30,
-            cwd=os.path.expanduser("~/d1-rest"),
+            cwd=os.path.expanduser("~/d1-rest-worker"),
         )
         if result.returncode == 0:
             return True, "ok"
@@ -117,6 +151,18 @@ def run_once():
     ts = int(time.time())
     all_ok = True
 
+    # 0. Extract SNlM0e token via GeminiClient
+    snlm0e = None
+    try:
+        snlm0e = asyncio.run(get_snlm0e(cookies))
+        if snlm0e:
+            print(f"  SNlM0e: {snlm0e[:20]}...", flush=True)
+        else:
+            print("  WARN: SNlM0e came back None (cookies may be stale)", flush=True)
+    except Exception as e:
+        print(f"  WARN: Failed to extract SNlM0e: {e}", flush=True)
+        traceback.print_exc()
+
     # 1. Push to google-auth-worker R2 (gemini + nlm)
     for target in ("gemini", "nlm"):
         ok, msg = push_to_auth_worker(cookies, target)
@@ -136,6 +182,23 @@ def run_once():
     nlm_payload = {"cookie_header": cookie_header, "updated_at": ts, "source": "push-session"}
     ok, msg = push_to_kv("notebooklm_auth", nlm_payload)
     print(f"  KV notebooklm_auth: {msg}", flush=True)
+    if not ok:
+        all_ok = False
+
+    # 4. Push SNlM0e to KV gemini_snlm0e
+    if snlm0e:
+        snlm0e_payload = {"snlm0e": snlm0e, "updated_at": ts, "source": "push-session"}
+        ok, msg = push_to_kv("gemini_snlm0e", snlm0e_payload)
+        print(f"  KV gemini_snlm0e: {msg}", flush=True)
+        if not ok:
+            all_ok = False
+    else:
+        print("  KV gemini_snlm0e: SKIPPED (no token)", flush=True)
+
+    # 5. Push to shared KV gemini_auth (cookie header for gemini-webapi-worker)
+    gemini_payload = {"cookie_header": cookie_header, "updated_at": ts, "source": "push-session"}
+    ok, msg = push_to_kv("gemini_auth", gemini_payload)
+    print(f"  KV gemini_auth: {msg}", flush=True)
     if not ok:
         all_ok = False
 
