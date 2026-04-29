@@ -128,6 +128,33 @@ const GEMINI_DIRECT = "https://generativelanguage.googleapis.com/v1beta/models";
 const ENDPOINT_ROTATE = "https://accounts.google.com/RotateCookies";
 const ROTATE_MIN_INTERVAL_MS = 60_000;  // 60s between rotations to avoid 429
 
+// ---------- Retry helper for service bindings ----------
+
+/**
+ * Fetch via a service binding with exponential backoff retry.
+ * Retries on network errors and 5xx responses. 4xx responses are returned immediately.
+ * @param {object} fetcher - Service binding (e.g. env.GOOGLE_AUTH)
+ * @param {Request} request - Request to send (will be cloned on each attempt)
+ * @param {number} maxRetries - Maximum number of attempts (default 3)
+ * @returns {Response}
+ */
+async function fetchWithRetry(fetcher, request, maxRetries = 3) {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      const resp = await fetcher.fetch(request.clone());
+      if (resp.ok) return resp;
+      if (resp.status >= 500 && attempt < maxRetries - 1) {
+        await new Promise(r => setTimeout(r, Math.pow(2, attempt) * 200));
+        continue;
+      }
+      return resp;
+    } catch (e) {
+      if (attempt === maxRetries - 1) throw e;
+      await new Promise(r => setTimeout(r, Math.pow(2, attempt) * 200));
+    }
+  }
+}
+
 // ---------- Shared auth: fetch cookies from NLM worker ----------
 
 let _nlmCookies = null;       // Cached cookies fetched from NLM worker
@@ -149,60 +176,32 @@ async function fetchNLMCookies(env) {
   const now = Date.now();
   if (_nlmCookies && (now - _nlmCookiesFetchedAt) < NLM_COOKIE_CACHE_MS) return _nlmCookies;
 
-  // Source 1: Check BOTH cookie keys — pick the freshest one
+  // Source 1: Check cookie keys — notebooklm_auth (primary) and profile key (fallback)
   if (env.KV_CACHE) {
     try {
-      const [jarResult, sharedResult, profileResult] = await Promise.allSettled([
-        env.KV_CACHE.get("nlm:cookie_jar_v2", { type: "json" }),
+      const [sharedResult, profileResult] = await Promise.allSettled([
         env.KV_CACHE.get("notebooklm_auth", { type: "text" }),
         env.KV_CACHE.get("nlm:cookies:authorityandbrand", { type: "text" }),
       ]);
-      const jar = jarResult.status === "fulfilled" ? jarResult.value : null;
       const sharedRaw = sharedResult.status === "fulfilled" ? sharedResult.value : null;
       const profileCookies = profileResult.status === "fulfilled" ? profileResult.value : null;
 
-      // Compare timestamps and pick the freshest
-      // Normalize: if timestamp > 1e12 it's milliseconds, convert to seconds
-      const normTs = (ts) => ts > 1e12 ? Math.floor(ts / 1000) : (ts || 0);
-      let jarStr = null, jarTs = 0;
-      if (jar?.cookies && typeof jar.cookies === "object") {
-        jarStr = Object.entries(jar.cookies).map(([k, v]) => `${k}=${v}`).join("; ");
-        jarTs = normTs(jar.updated_at);
-      }
-      let sharedStr = null, sharedTs = 0;
+      let sharedStr = null;
       if (sharedRaw) {
         try {
           const shared = JSON.parse(sharedRaw);
-          if (shared.cookie_header) { sharedStr = shared.cookie_header; sharedTs = normTs(shared.updated_at); }
+          if (shared.cookie_header) { sharedStr = shared.cookie_header; }
         } catch {}
       }
 
-      // Use the freshest available, with profile cookies as final fallback
-      const cookieStr = (jarTs >= sharedTs && jarStr) ? jarStr : (sharedStr || jarStr || profileCookies);
-      const source = (jarTs >= sharedTs && jarStr) ? "nlm:cookie_jar_v2"
-        : sharedStr ? "notebooklm_auth"
-        : jarStr ? "nlm:cookie_jar_v2"
+      // Use notebooklm_auth first, fall back to profile cookies
+      const cookieStr = sharedStr || profileCookies;
+      const source = sharedStr ? "notebooklm_auth"
         : profileCookies ? "nlm:cookies:authorityandbrand" : "none";
       if (cookieStr) {
         _nlmCookies = cookieStr;
         _nlmCookiesFetchedAt = now;
         console.log(`[fetchNLMCookies] Loaded cookies from KV ${source}`);
-        // Cross-sync: if one key is fresher, update the stale one (non-blocking)
-        if (jarTs > sharedTs && jarStr) {
-          env.KV_CACHE.put("notebooklm_auth", JSON.stringify({
-            cookie_header: jarStr, updated_at: jarTs, source: "cross-sync-from-jar",
-          })).catch(() => {});
-          env.KV_CACHE.put("nlm:cookies:authorityandbrand", jarStr).catch(() => {});
-        } else if (sharedTs > jarTs && sharedStr) {
-          const jarObj = {};
-          for (const pair of sharedStr.split(";")) {
-            const eq = pair.indexOf("=");
-            if (eq > 0) jarObj[pair.slice(0, eq).trim()] = pair.slice(eq + 1).trim();
-          }
-          env.KV_CACHE.put("nlm:cookie_jar_v2", JSON.stringify({
-            cookies: jarObj, updated_at: sharedTs, source: "cross-sync-from-shared",
-          })).catch(() => {});
-        }
         return _nlmCookies;
       }
     } catch (err) {
@@ -247,18 +246,18 @@ async function fetchNLMCookies(env) {
           signal: AbortSignal.timeout(10000),
         })
       );
-      // After NLM refresh, re-read cookie jar from KV
+      // After NLM refresh, re-read notebooklm_auth from KV
       if (env.KV_CACHE) {
-        const jar = await env.KV_CACHE.get("nlm:cookie_jar_v2", { type: "json" });
-        if (jar?.cookies) {
-          const cookieStr = Object.entries(jar.cookies)
-            .map(([k, v]) => `${k}=${v}`)
-            .join("; ");
-          if (cookieStr) {
-            _nlmCookies = cookieStr;
-            _nlmCookiesFetchedAt = now;
-            return _nlmCookies;
-          }
+        const sharedRaw = await env.KV_CACHE.get("notebooklm_auth", { type: "text" });
+        if (sharedRaw) {
+          try {
+            const shared = JSON.parse(sharedRaw);
+            if (shared.cookie_header) {
+              _nlmCookies = shared.cookie_header;
+              _nlmCookiesFetchedAt = now;
+              return _nlmCookies;
+            }
+          } catch {}
         }
       }
     } catch (err) {
@@ -326,11 +325,6 @@ async function rotateCookies(env) {
       if (match) {
         _cachedPSIDTS = match[1];
         _lastRotateAt = now;
-
-        // Persist to KV (TTL 30 min)
-        if (env.KV) {
-          await env.KV.put("rotated_psidts", JSON.stringify({ value: _cachedPSIDTS, ts: now }), { expirationTtl: 1800 });
-        }
 
         return _cachedPSIDTS;
       }
@@ -1198,9 +1192,9 @@ async function gwsTool(env, toolName, args = {}) {
 async function gwsDocsAppend(env, docId, text) {
   // Get SA token (same pattern as generateViaOfficialAPI)
   let saToken = null;
-  if (env.GAUTH) {
+  if (env.GOOGLE_AUTH) {
     try {
-      const authResp = await env.GAUTH.fetch(new Request("https://google-auth-worker.internal/token", {
+      const authResp = await fetchWithRetry(env.GOOGLE_AUTH, new Request("https://google-auth-worker.internal/token", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ force: false }),
@@ -1329,9 +1323,9 @@ async function generateViaOfficialAPI(prompt, env, { model = "gemini-2.5-flash",
   let saToken = null;
 
   // Method 1: Call google-auth-worker directly via service binding (always fresh)
-  if (!saToken && env.GAUTH) {
+  if (!saToken && env.GOOGLE_AUTH) {
     try {
-      const authResp = await env.GAUTH.fetch(new Request("https://google-auth-worker.internal/token", {
+      const authResp = await fetchWithRetry(env.GOOGLE_AUTH, new Request("https://google-auth-worker.internal/token", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ force: false }),
@@ -1595,11 +1589,11 @@ async function handleGenerateStream(request, env) {
         });
       }
     } catch (err) {
-      await send("error", { error: err.message });
+      await send("error", { error: err.message }).catch(() => {});
     } finally {
-      await writer.close();
+      await writer.close().catch(() => {});
     }
-  })();
+  })().catch(() => {}); // swallow any escape from finally
 
   return new Response(readable, {
     headers: {
@@ -2383,152 +2377,83 @@ async function handleGWS(request, env, gwsPath) {
 //   Tool list is cached 2 min in isolate memory so repeated calls don't incur latency
 
 // Our own Gemini-specific tools (always present regardless of bindings)
+// Flat tools kept for callOwnMCPTool dispatch (not advertised)
+const OWN_MCP_TOOLS_FLAT = [
+  "gemini_generate", "gemini_gems",
+  "nlm_workflow_ask", "nlm_workflow_add_source", "nlm_workflow_create_notebook",
+  "nlm_workflow_create_linked_doc", "nlm_workflow_create_linked_sheet",
+  "nlm_workflow_append_doc", "nlm_workflow_append_sheet",
+  "nlm_workflow_sync_all", "nlm_workflow_generate_artifact", "nlm_workflow_health",
+];
+
+// Grouped tools for tools/list (token-efficient)
 const OWN_MCP_TOOLS = [
   {
-    name: "gemini_generate",
-    description: "Generate AI content using Gemini. Supports model selection, gem personas, automatic NotebookLM grounding (122 legal notebooks), and Google Drive file context. In web-cookie mode include @YouTube/@Gmail/@Maps/@Flights in prompt to invoke Gemini extensions.",
+    name: "gemini",
+    description: `Gemini AI with NotebookLM grounding and Drive file context.
+
+Actions: generate, gems
+
+- generate: prompt (required), model, system, gem (Gem ID for persona), notebooks (bool, default true), notebook_ids (array), drive_file_ids (array), chat_meta (array for multi-turn). In web-cookie mode use @YouTube/@Gmail/@Maps in prompt for extensions.
+- gems: action (list/create/update/delete), id (for update/delete), name, prompt (system instructions), description`,
     inputSchema: {
       type: "object",
       properties: {
-        prompt:         { type: "string", description: "The prompt. In web-cookie mode use @YouTube/@Gmail/@Maps etc. for Gemini extensions." },
-        model:          { type: "string", description: "Web-cookie model override", enum: Object.keys(WEB_MODELS) },
-        system:         { type: "string", description: "Optional system instruction" },
-        gem:            { type: "string", description: "Gem ID for AI persona (use gemini_gems action=list to find IDs)" },
-        notebooks:      { type: "boolean", description: "Enable NotebookLM grounding (default true)" },
-        notebook_ids:   { type: "array", items: { type: "string" }, description: "Pin to specific notebook IDs" },
-        drive_file_ids: { type: "array", items: { type: "string" }, description: "Google Drive file IDs to inject as context" },
-        chat_meta:      { type: "array", items: {}, description: "Previous session [cid,rid,...] for multi-turn" },
-      },
-      required: ["prompt"],
-    },
-  },
-  {
-    name: "gemini_gems",
-    description: "Manage Gemini gems (AI personas with system instructions). Actions: list (predefined + custom), create (name+prompt+description?), update (id+name+prompt+description?), delete (id).",
-    inputSchema: {
-      type: "object",
-      properties: {
-        action:      { type: "string", enum: ["list", "create", "update", "delete"] },
-        id:          { type: "string", description: "Gem ID (required for update/delete)" },
-        name:        { type: "string", description: "Gem name (required for create/update)" },
-        prompt:      { type: "string", description: "System instructions (required for create/update)" },
-        description: { type: "string" },
+        action:         { type: "string", enum: ["generate", "gems"] },
+        prompt:         { type: "string" },
+        model:          { type: "string", enum: Object.keys(WEB_MODELS) },
+        system:         { type: "string" },
+        gem:            { type: "string" },
+        notebooks:      { type: "boolean" },
+        notebook_ids:   { type: "array", items: { type: "string" } },
+        drive_file_ids: { type: "array", items: { type: "string" } },
+        chat_meta:      { type: "array" },
+        id:             { type: "string" },
+        name:           { type: "string" },
+        description:    { type: "string" },
       },
       required: ["action"],
     },
   },
-  // --- NLM workflow orchestration tools ---
   {
-    name: "nlm_workflow_ask",
-    description: "Ask a question to a NotebookLM notebook's AI (via NLM service binding).",
+    name: "nlm_workflow",
+    description: `LIVE NotebookLM operations — query, create notebooks, add sources, generate artifacts, export. For static catalog search of existing notebooks (faster, ~1ms vs 5s) use claude-brain server's notebooklm_registry tool.
+
+NotebookLM workflow orchestration — query notebooks, manage sources, living docs, artifacts.
+
+Actions: ask, add_source, create_notebook, create_linked_doc, create_linked_sheet, append_doc, append_sheet, sync_all, generate_artifact, health
+
+- ask: notebook_id + question (required) — query a notebook's AI
+- add_source: notebook_id (required), url or content, title
+- create_notebook: title
+- create_linked_doc: notebook_id + title (required), content — creates Google Doc + NLM source
+- create_linked_sheet: notebook_id + title (required), initial_data (2D array)
+- append_doc: doc_id + text (required), source_id — append + sync NLM source
+- append_sheet: sheet_id + rows (required), source_id, range
+- sync_all: (no params) — sync all stale living docs
+- generate_artifact: notebook_id + artifact_type (required: audio/video/report/quiz/briefing/slides/infographic/mindmap/timeline), instructions
+- health: (no params) — check NLM service binding status`,
     inputSchema: {
       type: "object",
       properties: {
-        notebook_id: { type: "string", description: "Notebook ID to query" },
-        question:    { type: "string", description: "Question to ask the notebook AI" },
+        action:        { type: "string", enum: ["ask", "add_source", "create_notebook", "create_linked_doc", "create_linked_sheet", "append_doc", "append_sheet", "sync_all", "generate_artifact", "health"] },
+        notebook_id:   { type: "string" },
+        question:      { type: "string" },
+        url:           { type: "string" },
+        title:         { type: "string" },
+        content:       { type: "string" },
+        doc_id:        { type: "string" },
+        text:          { type: "string" },
+        source_id:     { type: "string" },
+        sheet_id:      { type: "string" },
+        rows:          { type: "array" },
+        range:         { type: "string" },
+        initial_data:  { type: "array" },
+        artifact_type: { type: "string" },
+        instructions:  { type: "string" },
       },
-      required: ["notebook_id", "question"],
+      required: ["action"],
     },
-  },
-  {
-    name: "nlm_workflow_add_source",
-    description: "Add a URL or text source to a NotebookLM notebook.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        notebook_id: { type: "string", description: "Notebook ID" },
-        url:         { type: "string", description: "URL to add (for URL sources)" },
-        title:       { type: "string", description: "Source title" },
-        content:     { type: "string", description: "Text content (for text sources, omit url)" },
-      },
-      required: ["notebook_id"],
-    },
-  },
-  {
-    name: "nlm_workflow_create_notebook",
-    description: "Create a new NotebookLM notebook.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        title: { type: "string", description: "Notebook title" },
-      },
-    },
-  },
-  {
-    name: "nlm_workflow_create_linked_doc",
-    description: "Create a Google Doc, add it to a NotebookLM notebook as a source, and register as a living doc for auto-sync.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        notebook_id: { type: "string", description: "Notebook ID" },
-        title:       { type: "string", description: "Document title" },
-        content:     { type: "string", description: "Initial document content" },
-      },
-      required: ["notebook_id", "title"],
-    },
-  },
-  {
-    name: "nlm_workflow_create_linked_sheet",
-    description: "Create a Google Sheet, add it to a NotebookLM notebook as a source, and register as a living doc for auto-sync.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        notebook_id:  { type: "string", description: "Notebook ID" },
-        title:        { type: "string", description: "Sheet title" },
-        initial_data: { type: "array", items: { type: "array", items: { type: "string" } }, description: "2D array of rows/columns for initial data" },
-      },
-      required: ["notebook_id", "title"],
-    },
-  },
-  {
-    name: "nlm_workflow_append_doc",
-    description: "Append text to a Google Doc and sync the NLM source. Falls back to direct Docs API if GWS binding fails.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        doc_id:    { type: "string", description: "Google Doc ID" },
-        text:      { type: "string", description: "Text to append" },
-        source_id: { type: "string", description: "NLM source ID to sync after appending (optional)" },
-      },
-      required: ["doc_id", "text"],
-    },
-  },
-  {
-    name: "nlm_workflow_append_sheet",
-    description: "Append rows to a Google Sheet and sync the NLM source.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        sheet_id:  { type: "string", description: "Google Sheet ID" },
-        rows:      { type: "array", items: { type: "array", items: { type: "string" } }, description: "2D array of rows to append" },
-        source_id: { type: "string", description: "NLM source ID to sync after appending (optional)" },
-        range:     { type: "string", description: "Sheet range (default: Sheet1)" },
-      },
-      required: ["sheet_id", "rows"],
-    },
-  },
-  {
-    name: "nlm_workflow_sync_all",
-    description: "Check for stale living docs and sync all NLM sources linked to Google Drive files.",
-    inputSchema: { type: "object", properties: {} },
-  },
-  {
-    name: "nlm_workflow_generate_artifact",
-    description: "Generate a NotebookLM studio artifact (audio, video, report, etc.).",
-    inputSchema: {
-      type: "object",
-      properties: {
-        notebook_id:   { type: "string", description: "Notebook ID" },
-        artifact_type: { type: "string", description: "Type: audio, video, report, quiz, briefing, slides, infographic, mindmap, timeline" },
-        instructions:  { type: "string", description: "Custom instructions for generation" },
-      },
-      required: ["notebook_id", "artifact_type"],
-    },
-  },
-  {
-    name: "nlm_workflow_health",
-    description: "Check NLM service binding health and auth status.",
-    inputSchema: { type: "object", properties: {} },
   },
 ];
 
@@ -2613,16 +2538,16 @@ async function getAllMCPTools(env) {
   ]);
 
   const nlmTools = (nlmResult.status === "fulfilled" ? nlmResult.value : [])
-    .map(t => ({ ...t, name: `nlm_${t.name}`, description: `[NotebookLM] ${t.description ?? t.name}` }));
+    .map(t => ({ ...t, name: `nlm_${t.name}`, description: `[PROXY → notebooklm-worker, +50ms latency] ${t.description ?? t.name} — Prefer calling notebooklm-worker directly when possible.` }));
 
   const gwsTools = (gwsResult.status === "fulfilled" ? gwsResult.value : [])
-    .map(t => ({ ...t, name: `gws_${t.name}`, description: `[GWS] ${t.description ?? t.name}` }));
+    .map(t => ({ ...t, name: `gws_${t.name}`, description: `[PROXY → gws-worker, +50ms latency] ${t.description ?? t.name} — Prefer calling gws-worker directly when possible.` }));
 
   // Only expose workflow-related HUB tools (workflows, skills, pipeline, agents)
   const HUB_TOOL_ALLOWLIST = new Set(["workflows", "skills", "pipeline", "agents"]);
   const hubTools = (hubResult.status === "fulfilled" ? hubResult.value : [])
     .filter(t => HUB_TOOL_ALLOWLIST.has(t.name))
-    .map(t => ({ ...t, name: `hub_${t.name}`, description: `[HUB] ${t.description ?? t.name}` }));
+    .map(t => ({ ...t, name: `hub_${t.name}`, description: `[PROXY → litigation-hub-worker, +50ms latency] ${t.description ?? t.name} — Prefer calling litigation-hub-worker directly when possible.` }));
 
   _toolsCache = [...OWN_MCP_TOOLS, ...nlmTools, ...gwsTools, ...hubTools];
   _toolsCacheAt = now;
@@ -2785,21 +2710,28 @@ async function handleMCP(request, env) {
       return respond({ tools: await getAllMCPTools(env) });
 
     case "tools/call": {
-      const toolName = params?.name;
+      let toolName = params?.name;
       const toolArgs = params?.arguments ?? {};
       if (!toolName) return mcpErr(-32602, "Missing tool name");
+
+      // Route grouped tools: gemini({action: "generate"}) → "gemini_generate"
+      // nlm_workflow({action: "ask"}) → "nlm_workflow_ask"
+      if (toolArgs.action) {
+        const grouped = OWN_MCP_TOOLS.find(t => t.name === toolName);
+        if (grouped) {
+          toolName = `${toolName}_${toolArgs.action}`;
+        }
+      }
 
       try {
         let text;
         if (toolName.startsWith("nlm_workflow_")) {
-          // NLM workflow tools are handled locally (they orchestrate NLM calls internally)
           text = await callOwnMCPTool(toolName, toolArgs, env);
         } else if (toolName.startsWith("nlm_") && env.NLM) {
           text = await proxyMCPCall(env.NLM, toolName.slice(4), toolArgs, {}, 35000);
         } else if (toolName.startsWith("hub_") && env.HUB) {
           text = await proxyMCPCall(env.HUB, toolName.slice(4), toolArgs, {}, 35000);
         } else if (toolName.startsWith("gws_") && env.GWS) {
-          // Auto-wrap plain text queries for drive_search (Google Drive API requires query syntax)
           if (toolName === "gws_drive_search" && toolArgs.query && !/\b(contains|in|=|and|or|not|mimeType|fullText|name|modifiedTime)\b/i.test(toolArgs.query)) {
             toolArgs.query = `fullText contains '${toolArgs.query.replace(/'/g, "\\'")}'`;
           }
@@ -2822,6 +2754,7 @@ async function handleMCP(request, env) {
 
 export default {
   async fetch(request, env) {
+    try {
     const url    = new URL(request.url);
     const method = request.method.toUpperCase();
     let path     = url.pathname;
@@ -2903,7 +2836,10 @@ export default {
         if (pushKey) {
           const authHeader = request.headers.get("Authorization") || "";
           const token = authHeader.replace(/^Bearer\s+/i, "");
-          if (token !== pushKey) {
+          const aBytes = new TextEncoder().encode(token);
+          const bBytes = new TextEncoder().encode(pushKey);
+          const tokenValid = aBytes.length === bBytes.length && crypto.subtle.timingSafeEqual(aBytes, bBytes);
+          if (!tokenValid) {
             return jsonResponse({ error: "Unauthorized — provide valid Bearer token" }, 401);
           }
         }
@@ -2924,41 +2860,18 @@ export default {
         _nlmCookies = cookieStr;
         _nlmCookiesFetchedAt = Date.now();
 
-        // Write to KV_CACHE so all isolates pick it up
-        if (env.KV_CACHE) {
-          const jarData = typeof cookies === "object" ? cookies : {};
-          if (typeof cookies === "string") {
-            for (const pair of cookies.split(";")) {
-              const eq = pair.indexOf("=");
-              if (eq > 0) jarData[pair.slice(0, eq).trim()] = pair.slice(eq + 1).trim();
-            }
-          }
-          // Write to ALL cookie keys so both Gemini worker AND NLM worker stay in sync
-          await Promise.all([
-            // Key 1: Gemini worker reads this
-            env.KV_CACHE.put("nlm:cookie_jar_v2", JSON.stringify({
-              cookies: jarData,
-              updated_at: Math.floor(Date.now() / 1000),
-              source: "gemini-worker-cookies-update",
-            })),
-            // Key 2: NLM worker reads this FIRST (shared auth from d1-rest / google-auth-worker)
-            env.KV_CACHE.put("notebooklm_auth", JSON.stringify({
-              cookie_header: cookieStr,
-              updated_at: Math.floor(Date.now() / 1000),
-              source: "gemini-worker-cookies-update",
-            })),
-            // Key 3: NLM worker reads this as fallback
-            env.KV_CACHE.put("nlm:cookies:authorityandbrand", cookieStr),
-          ]);
-          // Invalidate NLM worker's auth token cache so it re-fetches
-          await Promise.all([
-            env.KV_CACHE.delete("nlm:auth_tokens").catch(() => {}),
-            env.KV_CACHE.delete("nlm:auth_tokens:authorityandbrand").catch(() => {}),
-          ]);
+        // Proxy cookie write to google-auth-worker — this worker is read-only for KV auth
+        if (env.GOOGLE_AUTH) {
+          const proxyResp = await fetchWithRetry(env.GOOGLE_AUTH,
+            new Request("https://google-auth-worker.internal/cookies/push", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ target: "gemini", cookies: cookies }),
+            })
+          );
+          return proxyResp;
         }
-
-        const names = cookieStr.split(";").map(c => c.trim().split("=")[0]).filter(Boolean);
-        return jsonResponse({ success: true, cookie_count: names.length, names, cached: true, kv_written: !!env.KV_CACHE });
+        return new Response(JSON.stringify({ error: "GOOGLE_AUTH binding unavailable" }), { status: 503, headers: { "Content-Type": "application/json" } });
       } catch (err) {
         return jsonResponse({ error: err.message }, 500);
       }
@@ -3024,5 +2937,9 @@ export default {
                "POST /workspace/execute", "GET /workspace/actions",
                "POST /nlm/tools/:tool", "ANY /gws/*"],
     }, 404);
+    } catch (err) {
+      console.error(JSON.stringify({ event: "unhandled_exception", path: new URL(request.url).pathname, error: err.message, stack: err.stack?.split('\n')[0] }));
+      return jsonResponse({ error: "Internal server error", message: err.message }, 500);
+    }
   },
 };

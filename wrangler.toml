@@ -1,0 +1,58 @@
+name = "gemini-webapi-worker"
+main = "src/index.js"
+compatibility_date = "2025-09-15"
+compatibility_flags = ["nodejs_compat"]
+account_id = "e105d76aa6c851abdbd13d34d901cc7c"
+
+[vars]
+WORKER_ENV = "production"
+AI_GATEWAY_ID = "automation-hub"
+ACCOUNT_ID = "e105d76aa6c851abdbd13d34d901cc7c"
+
+# Workers AI binding — Gemma fallback, no external key needed
+[ai]
+binding = "AI"
+
+# Service bindings — worker-to-worker calls (internal, no network overhead)
+[[services]]
+binding = "HUB"
+service = "claude-brain"
+
+[[services]]
+binding = "NLM"
+service = "notebooklm-worker"
+
+[[services]]
+binding = "GWS"
+service = "gws-worker"
+
+[[services]]
+binding = "GOOGLE_AUTH"
+service = "google-auth-worker"
+
+# KV namespace for caching (catalog, tool lists, etc.)
+[[kv_namespaces]]
+binding = "KV"
+id = "227877f59bc04701b09ff841d917933f"
+
+# KV_CACHE — shared with google-auth-worker, d1-rest, gws-worker
+# Contains google_access_token (service account bearer token)
+[[kv_namespaces]]
+binding = "KV_CACHE"
+id = "e0ba67cf57c24ab49a7a3be5f20ece05"
+
+# R2 bucket — shared with notebooklm-worker for unified auth
+# Contains auth-state.json (Playwright cookies from `notebooklm login`)
+[[r2_buckets]]
+binding = "R2_AUTH"
+bucket_name = "notebooklm-storage"
+
+[observability]
+enabled = true
+
+# Secrets (set via `wrangler secret put` or Cloudflare API):
+#   GEMINI_API_KEY   — Google AI Studio key (used with automation-hub AI Gateway)
+#   SECURE_1PSID     — Google __Secure-1PSID cookie (web auth)
+#   SECURE_1PSIDTS   — Google __Secure-1PSIDTS cookie (optional)
+#   SESSION_KEY      — Alias for SECURE_1PSID (mirrors hub naming)
+
