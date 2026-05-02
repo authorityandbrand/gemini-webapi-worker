@@ -1,5 +1,29 @@
 # Changelog — gemini-webapi-worker
 
+## 2026-05-02: AI Gateway Binding, GEMINI_API_KEY Added, Secret Cleanup
+
+### Added
+- Formal `[[ai_gateways]]` binding in `wrangler.toml` — Workers AI fallback now routes through `automation-hub` AI Gateway
+- `GEMINI_API_KEY` secret added — was missing, blocking Gemini function calling via API key path (Path A in `handleOpenAICompletions`)
+
+### Changed
+- `generateViaWorkersAI()` in `src/index.js` now passes `{ gateway: { id: "automation-hub" } }` as third argument to `env.AI.run()`
+- `wrangler.toml`: `AI_GATEWAY_ID` var retained for backward-compat URL construction; formal `[[ai_gateways]]` binding added alongside it
+- Service binding and secrets sections rewritten with role documentation and dead-secret identification
+
+### Architecture Clarification
+- Claude model calls: `HUB` service binding → claude-brain → `claude.ai` (SESSION_KEY in claude-brain). NOT Anthropic API.
+- Gemini API calls: `GEMINI_API_KEY` → `gateway.ai.cloudflare.com/v1/{account}/automation-hub/google-ai-studio/...`
+- Workers AI fallback: `env.AI.run()` with `{ gateway: { id: "automation-hub" } }`
+
+### Security — Secret Cleanup
+Removed 14 dead secrets that were never read by any active code path:
+`APISID`, `HSID`, `OSID`, `SAPISID`, `SECURE_1PAPISID`, `SECURE_1PSID`, `SECURE_1PSIDTS`, `SID`, `SSID`, `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN`
+
+Remaining active secrets: `GEMINI_API_KEY`, `SESSION_KEY`, `SESSION_PUSH_KEY`, `CLOUDFLARE_API_TOKEN`, `GITHUB_TOKEN`
+
+---
+
 ## 2026-04-13: Gemini Notebook CRUD + Workspace Relay + Cookie Requirements
 
 ### IMPORTANT: Cookie Requirements

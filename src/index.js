@@ -1445,7 +1445,7 @@ async function generateViaWorkersAI(prompt, env, { system = null } = {}) {
   const messages = [];
   if (system) messages.push({ role: "system", content: system });
   messages.push({ role: "user", content: prompt });
-  const result = await env.AI.run(WORKERS_MODEL, { messages });
+  const result = await env.AI.run(WORKERS_MODEL, { messages }, { gateway: { id: "automation-hub" } });
   if (!result?.response) throw new Error("No response from Workers AI");
   return { text: result.response, mode: "workers-ai", model: WORKERS_MODEL };
 }
@@ -2750,6 +2750,239 @@ async function handleMCP(request, env) {
   }
 }
 
+// ---------- Shared model alias map (used by OpenAI compat + health endpoint) ----------
+const GEMINI_MODEL_MAP = {
+  // Gemini 3 — subscription tier (web-cookie auth), highest capability
+  "gemini-3-pro-advanced":            "gemini-3-pro-advanced",
+  "gemini-3-flash-thinking-advanced": "gemini-3-flash-thinking-advanced",
+  "gemini-3-pro-plus":                "gemini-3-pro-plus",
+  "gemini-3-flash-thinking-plus":     "gemini-3-flash-thinking-plus",
+  "gemini-3-pro":                     "gemini-3-pro",
+  "gemini-3-flash-thinking":          "gemini-3-flash-thinking",
+  "gemini-3-flash-advanced":          "gemini-3-flash-advanced",
+  "gemini-3-flash-plus":              "gemini-3-flash-plus",
+  "gemini-3-flash":                   "gemini-3-flash",
+  // Gemini 2.5 — API-key tier (function calling supported)
+  "gemini-2.5-pro":                   "gemini-2.5-pro-preview-05-06",
+  "gemini-2.5-pro-preview":           "gemini-2.5-pro-preview-05-06",
+  "gemini-2.5-flash":                 "gemini-2.5-flash-preview-04-17",
+  "gemini-2.0-pro":                   "gemini-2.0-pro-exp",
+  "gemini-2.0-flash":                 "gemini-2.0-flash",
+  "gemini-1.5-pro":                   "gemini-1.5-pro-latest",
+  "gemini-1.5-flash":                 "gemini-1.5-flash-latest",
+  // Short aliases
+  "pro-advanced":   "gemini-3-pro-advanced",
+  "pro":            "gemini-3-pro-advanced",
+  "flash-thinking": "gemini-3-flash-thinking-advanced",
+  "flash":          "gemini-3-flash-advanced",
+};
+
+// Task-type → model routing advisor.
+// Callers pass taskType to get the right model without hardcoding.
+// web-cookie models (Gemini 3) = subscription access; api-key models (2.x) = function calling support.
+const TASK_MODEL_MAP = {
+  // Legal reasoning — highest capability
+  legal_analysis:        "gemini-3-pro-advanced",
+  strategy:              "gemini-3-pro-advanced",
+  rico:                  "gemini-3-pro-advanced",
+  constitutional:        "gemini-3-pro-advanced",
+  damages:               "gemini-3-pro-advanced",
+  // Deep reasoning — chain-of-thought required
+  deep_research:         "gemini-3-flash-thinking-advanced",
+  contradiction_detect:  "gemini-3-flash-thinking-advanced",
+  document_review:       "gemini-3-flash-thinking-plus",
+  // High-volume background tasks — speed + cost efficiency
+  batch_enrichment:      "gemini-3-flash-advanced",
+  summary:               "gemini-3-flash-advanced",
+  classify:              "gemini-3-flash-advanced",
+  // Tool-calling tasks — require API-key path (web-cookie doesn't support function calling)
+  tool_use:              "gemini-2.5-pro-preview-05-06",
+  agentic:               "gemini-2.5-flash-preview-04-17",
+};
+
+// ---------- OpenAI-compatible endpoint (AI Gateway Custom Provider) ----------
+// Two paths:
+//   A. tools[] present → Gemini REST API (function calling supported, requires GEMINI_API_KEY)
+//   B. no tools        → web-cookie subscription (Gemini 3, NLM grounding)
+// Cloudflare AI Gateway strips /v1 prefix → registered at /chat/completions.
+async function handleOpenAICompletions(request, env) {
+  let body;
+  try { body = await request.json(); }
+  catch { return jsonResponse({ error: { message: "Request body must be valid JSON.", type: "invalid_request_error" } }, 400); }
+
+  const { model: reqModel, messages = [], temperature, max_tokens, tools, tool_choice, task_type } = body;
+
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return jsonResponse({ error: { message: "'messages' must be a non-empty array.", type: "invalid_request_error" } }, 400);
+  }
+
+  // Model selection: explicit model > task_type routing > default
+  const routedModel = TASK_MODEL_MAP[task_type] || null;
+  const geminiModel = GEMINI_MODEL_MAP[reqModel] || reqModel || routedModel || "gemini-3-pro-advanced";
+
+  const created = Math.floor(Date.now() / 1000);
+  const completionId = `chatcmpl-${created}-${Math.random().toString(36).slice(2, 10)}`;
+
+  // ── Path A: tool calling — Gemini REST API (web-cookie can't do function calling) ──
+  if (Array.isArray(tools) && tools.length > 0) {
+    if (!env.GEMINI_API_KEY) {
+      return jsonResponse({ error: {
+        message: "Tool calling requires GEMINI_API_KEY secret. Web-cookie auth does not support function calling. Run: wrangler secret put GEMINI_API_KEY --name gemini-webapi-worker",
+        type: "server_error",
+      }}, 500);
+    }
+
+    // Use 2.5 Pro for tool calls if a Gemini 3 web-cookie model was requested
+    const apiModel = GEMINI_MODEL_MAP[reqModel] && !reqModel.startsWith("gemini-3")
+      ? GEMINI_MODEL_MAP[reqModel]
+      : "gemini-2.5-pro-preview-05-06";
+
+    const systemParts = messages.filter(m => m.role === "system").map(m => m.content);
+    const systemInstruction = systemParts.length > 0
+      ? { parts: [{ text: systemParts.join("\n\n") }] }
+      : undefined;
+
+    const contents = [];
+    for (const m of messages.filter(m => m.role !== "system")) {
+      if (m.role === "tool") {
+        contents.push({ role: "user", parts: [{ functionResponse: {
+          name: m.name ?? "tool",
+          response: { content: m.content },
+        }}]});
+      } else if (m.role === "assistant" && Array.isArray(m.tool_calls)) {
+        contents.push({ role: "model", parts: m.tool_calls.map(tc => ({
+          functionCall: { name: tc.function.name, args: JSON.parse(tc.function.arguments ?? "{}") },
+        }))});
+      } else {
+        const role = m.role === "assistant" ? "model" : "user";
+        const text = typeof m.content === "string" ? m.content
+          : Array.isArray(m.content) ? m.content.map(p => p.text ?? "").join("") : String(m.content ?? "");
+        contents.push({ role, parts: [{ text }] });
+      }
+    }
+
+    const functionDeclarations = tools
+      .filter(t => t.type === "function")
+      .map(t => ({
+        name: t.function.name,
+        description: t.function.description ?? "",
+        parameters: t.function.parameters ?? { type: "object", properties: {} },
+      }));
+
+    const geminiBody = {
+      contents,
+      tools: [{ functionDeclarations }],
+      generationConfig: { temperature: temperature ?? 0.1, maxOutputTokens: max_tokens ?? 1024 },
+      ...(systemInstruction ? { systemInstruction } : {}),
+    };
+    if (tool_choice === "none")     geminiBody.toolConfig = { functionCallingConfig: { mode: "NONE" } };
+    if (tool_choice === "required") geminiBody.toolConfig = { functionCallingConfig: { mode: "ANY"  } };
+
+    let apiResp, apiData;
+    try {
+      apiResp = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${apiModel}:generateContent?key=${env.GEMINI_API_KEY}`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(geminiBody) }
+      );
+      apiData = await apiResp.json();
+    } catch (e) {
+      return jsonResponse({ error: { message: e.message, type: "server_error" } }, 500);
+    }
+
+    if (!apiResp.ok) {
+      return jsonResponse({ error: { message: apiData?.error?.message ?? `Gemini API ${apiResp.status}`, type: "server_error" } }, apiResp.status);
+    }
+
+    const candidate = apiData.candidates?.[0];
+    const parts = candidate?.content?.parts ?? [];
+    const fnParts = parts.filter(p => p.functionCall);
+
+    if (fnParts.length > 0) {
+      return jsonResponse({
+        id: completionId, object: "chat.completion", created, model: apiModel,
+        choices: [{ index: 0, message: {
+          role: "assistant", content: null,
+          tool_calls: fnParts.map((p, i) => ({
+            id: `call_${completionId}_${i}`,
+            type: "function",
+            function: { name: p.functionCall.name, arguments: JSON.stringify(p.functionCall.args ?? {}) },
+          })),
+        }, finish_reason: "tool_calls" }],
+        usage: {
+          prompt_tokens:     apiData.usageMetadata?.promptTokenCount     ?? 0,
+          completion_tokens: apiData.usageMetadata?.candidatesTokenCount ?? 0,
+          total_tokens:      apiData.usageMetadata?.totalTokenCount      ?? 0,
+        },
+        _gemini: { auth_mode: "gemini-api", model: apiModel },
+      });
+    }
+
+    const text = parts.filter(p => p.text).map(p => p.text).join("");
+    return jsonResponse({
+      id: completionId, object: "chat.completion", created, model: apiModel,
+      choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
+      usage: {
+        prompt_tokens:     apiData.usageMetadata?.promptTokenCount     ?? 0,
+        completion_tokens: apiData.usageMetadata?.candidatesTokenCount ?? 0,
+        total_tokens:      apiData.usageMetadata?.totalTokenCount      ?? 0,
+      },
+      _gemini: { auth_mode: "gemini-api", model: apiModel },
+    });
+  }
+
+  // ── Path B: plain text completion via web-cookie subscription (Gemini 3 + NLM grounding) ──
+  const authMode = getAuthMode(env);
+  if (!authMode) {
+    return jsonResponse({ error: { message: "No auth configured on gemini-webapi-worker.", type: "server_error" } }, 500);
+  }
+
+  const systemParts = messages.filter(m => m.role === "system").map(m => m.content);
+  const systemPrompt = systemParts.join("\n\n") || null;
+  const conversationParts = messages
+    .filter(m => m.role !== "system")
+    .map(m => {
+      const content = typeof m.content === "string" ? m.content
+        : Array.isArray(m.content) ? m.content.map(p => p.text || "").join("") : String(m.content);
+      return m.role === "assistant" ? `Assistant: ${content}` : content;
+    });
+  const prompt = conversationParts.join("\n\n");
+
+  if (!prompt.trim()) {
+    return jsonResponse({ error: { message: "No user message content found in 'messages'.", type: "invalid_request_error" } }, 400);
+  }
+
+  let notebookContext = "";
+  try {
+    if (env.NLM) notebookContext = await buildNotebookContext(prompt, env, { maxSources: NLM_MAX_SOURCES }) || "";
+  } catch { /* grounding is best-effort */ }
+
+  const fullSystem = [notebookContext, systemPrompt].filter(Boolean).join("\n\n") || null;
+
+  try {
+    let result;
+    if (authMode === "web-cookie") {
+      result = await generateViaWebCookie(prompt, env, { model: geminiModel, temporary: false, system: fullSystem });
+    } else if (authMode === "workers-ai") {
+      result = await generateViaWorkersAI(prompt, env, { system: fullSystem });
+    } else {
+      return jsonResponse({ error: { message: "No auth configured.", type: "server_error" } }, 500);
+    }
+
+    const text = result.text || result.response || "";
+    const promptTokens = Math.ceil(prompt.length / 4);
+    const outputTokens = Math.ceil(text.length / 4);
+
+    return jsonResponse({
+      id: completionId, object: "chat.completion", created, model: geminiModel,
+      choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
+      usage: { prompt_tokens: promptTokens, completion_tokens: outputTokens, total_tokens: promptTokens + outputTokens },
+      _gemini: { auth_mode: authMode, grounded: !!notebookContext, task_type: task_type || null },
+    });
+  } catch (err) {
+    return jsonResponse({ error: { message: err.message, type: "server_error" } }, 500);
+  }
+}
+
 // ---------- Main router ----------
 
 export default {
@@ -2883,6 +3116,12 @@ export default {
     // Generate
     if (path === "/generate" && method === "POST") return handleGenerate(request, env);
     if (path === "/generate/stream" && method === "POST") return handleGenerateStream(request, env);
+
+    // OpenAI-compatible endpoint — used by Cloudflare AI Gateway custom provider
+    // Translates { model, messages } → internal /generate → OpenAI response shape
+    // Registered as: ai-gateway custom provider slug "gemini-subscription"
+    // Note: /v1 prefix is stripped above so gateway calls /v1/chat/completions → /chat/completions
+    if (path === "/chat/completions" && method === "POST") return handleOpenAICompletions(request, env);
 
     // Gems
     if (path === "/gems") {

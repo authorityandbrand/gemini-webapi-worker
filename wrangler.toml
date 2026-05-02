@@ -6,43 +6,59 @@ account_id = "e105d76aa6c851abdbd13d34d901cc7c"
 
 [vars]
 WORKER_ENV = "production"
-AI_GATEWAY_ID = "automation-hub"
 ACCOUNT_ID = "e105d76aa6c851abdbd13d34d901cc7c"
+# AI_GATEWAY_ID left as var for backward-compat URL construction in index.js
+AI_GATEWAY_ID = "automation-hub"
 
-# Workers AI binding — Gemma fallback, no external key needed
+# ── AI Gateway ───────────────────────────────────────────────────────────────
+# Formal binding for automation-hub AI Gateway.
+# Routes Workers AI calls through the gateway for caching and logging.
+# Gemini API calls already go through GEMINI_GW URL (gateway.ai.cloudflare.com/
+# v1/{account}/automation-hub/google-ai-studio/...) via GEMINI_API_KEY.
+# Claude calls go through HUB service binding (claude.ai — no key needed).
+[[ai_gateways]]
+binding = "AI_GATEWAY"
+id = "automation-hub"
+
+# ── Workers AI ───────────────────────────────────────────────────────────────
+# Free inference fallback. Primary AI: HUB → claude-brain → claude.ai.
 [ai]
 binding = "AI"
 
-# Service bindings — worker-to-worker calls (internal, no network overhead)
+# ── Service Bindings ─────────────────────────────────────────────────────────
+# claude-brain: AI gateway hub for all providers (claude.ai SESSION_KEY lives here)
+# All "claude", "sonnet", "opus" model calls route through this binding.
 [[services]]
 binding = "HUB"
 service = "claude-brain"
 
+# notebooklm-worker: NLM catalog, source queries, notebook tools
 [[services]]
 binding = "NLM"
 service = "notebooklm-worker"
 
+# gws-worker: Gmail, Drive, Calendar, Docs, Sheets (Google Workspace)
 [[services]]
 binding = "GWS"
 service = "gws-worker"
 
+# google-auth-worker: NLM + Gemini cookies via /cookies/nlm, /cookies/gemini
 [[services]]
 binding = "GOOGLE_AUTH"
 service = "google-auth-worker"
 
-# KV namespace for caching (catalog, tool lists, etc.)
+# ── KV ───────────────────────────────────────────────────────────────────────
 [[kv_namespaces]]
 binding = "KV"
 id = "227877f59bc04701b09ff841d917933f"
 
-# KV_CACHE — shared with google-auth-worker, d1-rest, gws-worker
-# Contains google_access_token (service account bearer token)
+# Shared namespace — same as google-auth-worker KV, gws-worker, notebooklm-worker
 [[kv_namespaces]]
 binding = "KV_CACHE"
 id = "e0ba67cf57c24ab49a7a3be5f20ece05"
 
-# R2 bucket — shared with notebooklm-worker for unified auth
-# Contains auth-state.json (Playwright cookies from `notebooklm login`)
+# ── R2 ───────────────────────────────────────────────────────────────────────
+# Shared auth store with notebooklm-worker (Playwright cookies)
 [[r2_buckets]]
 binding = "R2_AUTH"
 bucket_name = "notebooklm-storage"
@@ -50,9 +66,17 @@ bucket_name = "notebooklm-storage"
 [observability]
 enabled = true
 
-# Secrets (set via `wrangler secret put` or Cloudflare API):
-#   GEMINI_API_KEY   — Google AI Studio key (used with automation-hub AI Gateway)
-#   SECURE_1PSID     — Google __Secure-1PSID cookie (web auth)
-#   SECURE_1PSIDTS   — Google __Secure-1PSIDTS cookie (optional)
-#   SESSION_KEY      — Alias for SECURE_1PSID (mirrors hub naming)
+# ── Secrets (wrangler secret put <NAME> --name gemini-webapi-worker) ─────────
+# GEMINI_API_KEY    — REQUIRED for Gemini function calling and gateway path.
+#                     Currently MISSING — add with: wrangler secret put GEMINI_API_KEY
+# SESSION_KEY       — Google __Secure-1PSID cookie (Gemini web auth, no key needed)
+# SESSION_PUSH_KEY  — Auth token for /push endpoint
+# CLOUDFLARE_API_TOKEN — For Cloudflare API calls
+# GITHUB_TOKEN      — For GitHub integration
+#
+# Dead secrets that can be removed (not read by any active code path):
+#   APISID/HSID/OSID/SAPISID/SECURE_*/SID/SSID — Individual cookie values;
+#     auth comes from GOOGLE_AUTH service binding → KV_CACHE, not env vars.
+#   GOOGLE_OAUTH_CLIENT_ID/SECRET, GOOGLE_CLIENT_ID/SECRET,
+#   GOOGLE_REFRESH_TOKEN — Not referenced in index.js for this worker.
 
