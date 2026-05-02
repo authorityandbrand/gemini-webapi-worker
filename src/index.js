@@ -1522,10 +1522,15 @@ async function handleGenerate(request, env) {
         gemId: gem,
         chatMeta: chat_meta,
       });
+    } else if (authMode === "gemini-api") {
+      result = await generateViaOfficialAPI(prompt, env, {
+        model: model || "gemini-2.5-flash",
+        system: apiSystem,
+      });
     } else if (authMode === "workers-ai") {
       result = await generateViaWorkersAI(prompt, env, { system: fullSystem });
     } else {
-      return jsonResponse({ error: "No auth configured. Run 'notebooklm login' to set up cookies.", hint: "Web-cookie mode requires valid Google session cookies in R2_AUTH." }, 500);
+      return jsonResponse({ error: "No auth configured. Set GEMINI_API_KEY, SECURE_1PSID, or SESSION_KEY.", hint: "Run 'notebooklm login' or add GEMINI_API_KEY secret." }, 500);
     }
 
     // Omit session object from result (just expose ids)
