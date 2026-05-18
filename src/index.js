@@ -1,80 +1,61 @@
 /**
- * Gemini WebAPI Cloudflare Worker  v5.3.1
+ * Gemini WebAPI Cloudflare Worker  v5.4.1
  *
  * NEW in v5.2:
- *   - Drive file context: pass `drive_file_ids` array to /generate — worker fetches content
- *     from GWS binding and injects it as system context before the NLM notebook grounding
- *   - Workspace relay: POST /workspace/chat routes to GWS service binding; supports
- *     chat (gmail/calendar/tasks) and batch tool execution
- *   - MCP tool: workspace_action — execute any GWS action (send_email, create_event, …)
- *     directly from Gemini context
+ *   - Drive file context: pass `drive_file_ids` in /generate to inject Google Drive
+ *     file content as system context before NLM notebook grounding
+ *   - Workspace relay: POST /workspace/chat routes to GWS service binding
  *
  * NEW in v5.1:
- *   - MCP server: POST /mcp (Streamable HTTP, spec-compliant) + GET/POST /sse (legacy SSE)
- *     exposes all Gemini tools as MCP tools for claude.ai / other clients
- *   - Gem personas: GET/POST /gems to list and invoke Gemini Gem personas
- *   - Streaming: GET /stream?prompt=… for SSE token-by-token Gemini output
- *   - /health: includes auth_mode, available bindings, model list
+ *   - MCP server: POST /mcp (Streamable HTTP) + GET/POST /sse (legacy SSE)
+ *   - Gem personas: GET/POST /gems
+ *   - Streaming: GET /generate/stream (SSE)
+ *   - /health: includes auth_mode, bindings, model list
  *
- * AUTH (priority order):
- *   1. web-cookie  — Gemini Advanced subscription (gemini-3-* models, NLM grounding)
- *   2. gemini-api  — GEMINI_API_KEY (gemini-2.5-* only, uses quota, no NLM grounding)
- *   3. workers-ai  — Free Workers AI inference fallback
+ * v5.4.1 changes:
+ *   - Subscription tier (web-cookie / gemini-3-*) is the ONLY auth path
+ *   - GEMINI_API_KEY removed entirely — no fallback to official API
+ *   - gemini-2.x / gemini-1.x model aliases removed
+ *   - tool_use / agentic task types route to gemini-3-flash-thinking-advanced
+ *   - OpenAI /chat/completions: tools[] stripped (subscription doesn't support function calling)
+ *
+ * AUTH (single path):
+ *   web-cookie — Gemini Advanced subscription (gemini-3-* models, NLM grounding)
+ *   Cookies: SECURE_1PSID (web, Gemini Advanced subscription) | GOOGLE_AUTH/NLM binding | Workers AI (fallback)
+ *   Workers AI (env.AI) — free fallback only when no cookies/NLM available
  *
  * BINDINGS (all optional — worker degrades gracefully):
- *   AUTH        SECURE_1PSID (web, full features) | GEMINI_API_KEY (official API) | Workers AI (free)
- *   NLM         Auto-grounding from 122 notebooks / 2690 legal sources  (NLM binding)
+ *   NLM         Auto-grounding from notebooks / legal sources  (NLM binding)
  *   DRIVE       drive_file_ids in /generate injects file text as context (GWS binding)
- *   HUB         Claude relay + AI Gateway logging                        (HUB binding)
+ *   HUB         Claude relay + AI Gateway logging              (HUB binding)
  *   KV/KV_CACHE Response cache + session state
  *   R2_AUTH     Playwright cookies shared with notebooklm-worker
+ *   GOOGLE_AUTH Cookie refresh from google-auth-worker
  *
- * ENDPOINTS:
- *   POST /generate              — Main Gemini generate (web-cookie: inner[19]; api: system prefix)
- *   POST /generate/stream       — Streaming generate (web-cookie + gemini-api only)
- *   POST /chat                  — Multi-turn chat (web-cookie only)
- *   POST /mcp                   — MCP Streamable HTTP transport
- *   GET  /sse                   — MCP SSE transport (legacy)
- *   POST /sse                   — MCP SSE messages
- *   POST /workspace/chat        — GWS workspace relay
- *   GET  /gems                  — List Gem personas
- *   POST /gems/:gemId           — Invoke a Gem
- *   GET  /stream                — SSE streaming generate
- *   GET  /health                — Health + capabilities
- *   POST /push                  — Push session cookies (SESSION_PUSH_KEY auth)
- *   POST /cookies/nlm           — Push NLM cookies
- *   POST /cookies/gemini        — Push Gemini web cookies
- *
- * GENERATE OPTIONS:
- *   prompt, model (default: gemini-3-flash), system, notebooks (bool),
- *   notebook_ids[], drive_file_ids[], gem, temperature, max_tokens,
- *   chat_meta=[cid,rid,mid], stream (bool)
- *
- * MODEL NAMES:
- *   web-cookie models: gemini-3-flash/pro/thinking ± plus/advanced
- *   MULTI-TURN  chat_meta=[cid,rid,mid] for conversation continuity
- *
- * RESPONSE (web-cookie):
- *   { text, thoughts, images[], candidates[], session:{cid,rid,mid}, grounded, model, auth_mode }
+ * MODELS (subscription tier only):
+ *   gemini-3-flash / gemini-3-flash-plus / gemini-3-flash-advanced
+ *   gemini-3-flash-thinking / gemini-3-flash-thinking-plus / gemini-3-flash-thinking-advanced
+ *   gemini-3-pro / gemini-3-pro-plus / gemini-3-pro-advanced
  */
 
 "use strict";
 
 // ─── Model registry ───────────────────────────────────────────────────────────
-// Inner model IDs used by Gemini web interface (web-cookie path)
-const GEMINI_WEB_MODELS = {
+const WEB_MODELS = {
   "gemini-3-flash":                  { id: "fbb127bbb056c959", cap: 1 },
-  "gemini-3-flash-thinking":         { id: "5bf011840784117a", cap: 1 },
-  "gemini-3-flash-plus":             { id: "fd9d4e15f6ab2ccd", cap: 1 },
-  "gemini-3-flash-advanced":         { id: "0e6a8fc4d8e32e82", cap: 1 },
-  "gemini-3-flash-thinking-plus":    { id: "2f8f2d83bfca7e1b", cap: 1 },
-  "gemini-3-flash-thinking-advanced":{ id: "4a7e9c12b5d83f6e", cap: 1 },
   "gemini-3-pro":                    { id: "9d8ca3786ebdfbea", cap: 1 },
-  "gemini-3-pro-plus":               { id: "2c4f891a3d75b6e8", cap: 1 },
-  "gemini-3-pro-advanced":           { id: "7f3b9e5c2a81d047", cap: 1 },
+  "gemini-3-flash-thinking":         { id: "5bf011840784117a", cap: 1 },
+  "gemini-3-flash-plus":             { id: "56fdd199312815e2", cap: 4 },
+  "gemini-3-pro-plus":               { id: "e6fa609c3fa255c0", cap: 4 },
+  "gemini-3-flash-thinking-plus":    { id: "e051ce1aa80aa576", cap: 4 },
+  "gemini-3-flash-advanced":         { id: "56fdd199312815e2", cap: 2 },
+  "gemini-3-pro-advanced":           { id: "e6fa609c3fa255c0", cap: 2 },
+  "gemini-3-flash-thinking-advanced":{ id: "e051ce1aa80aa576", cap: 2 },
 };
 
-// alias map (used by OpenAI compat + health endpoint) ----------
+// API_MODEL_MAP removed — subscription tier only, no API key path
+
+// alias map (used by OpenAI compat + health endpoint)
 const GEMINI_MODEL_MAP = {
   // Gemini 3 — subscription tier (web-cookie auth), highest capability
   "gemini-3-pro-advanced":            "gemini-3-pro-advanced",
@@ -86,80 +67,142 @@ const GEMINI_MODEL_MAP = {
   "gemini-3-flash-advanced":          "gemini-3-flash-advanced",
   "gemini-3-flash-plus":              "gemini-3-flash-plus",
   "gemini-3-flash":                   "gemini-3-flash",
-  // Gemini 2.5 — API-key tier (function calling, no NLM grounding)
-  "gemini-2.5-pro":                   "gemini-2.5-pro",
-  "gemini-2.5-flash":                 "gemini-2.5-flash",
-  // short aliases
+  // Gemini 2.x/1.x removed — subscription tier (gemini-3-*) only
+  // Short aliases
   "pro-advanced":   "gemini-3-pro-advanced",
   "pro":            "gemini-3-pro-advanced",
-  "flash-thinking": "gemini-3-flash-thinking",
-  "thinking":       "gemini-3-flash-thinking",
-  "flash":          "gemini-3-flash",
-};
-// API model names used when GEMINI_API_KEY is set
-const GEMINI_API_MODELS = {
-  "gemini-3-pro":                     "gemini-2.5-pro",
-  "gemini-3-pro-plus":                "gemini-2.5-pro",
-  "gemini-3-pro-advanced":            "gemini-2.5-pro",
-  "gemini-3-flash":                   "gemini-2.5-flash",
-  "gemini-3-flash-thinking":          "gemini-2.5-flash",
-  "gemini-3-flash-plus":              "gemini-2.5-flash",
-  "gemini-3-flash-advanced":          "gemini-2.5-flash",
-  "gemini-3-flash-thinking-plus":     "gemini-2.5-flash",
-  "gemini-3-flash-thinking-advanced": "gemini-2.5-flash",
+  "flash-thinking": "gemini-3-flash-thinking-advanced",
+  "flash":          "gemini-3-flash-advanced",
 };
 
-const DEFAULT_MODEL = "gemini-3-flash";
-const GEMINI_GW   = `https://gateway.ai.cloudflare.com/v1/e105d76aa6c851abdbd13d34d901cc7c/automation-hub/google-ai-studio/v1beta/models`;
-const GEMINI_DIRECT = `https://generativelanguage.googleapis.com/v1beta/models`;
+const TASK_MODEL_MAP = {
+  // Legal reasoning — highest capability
+  legal_analysis:        "gemini-3-pro-advanced",
+  strategy:              "gemini-3-pro-advanced",
+  rico:                  "gemini-3-pro-advanced",
+  constitutional:        "gemini-3-pro-advanced",
+  damages:               "gemini-3-pro-advanced",
+  // Deep reasoning — chain-of-thought required
+  deep_research:         "gemini-3-flash-thinking-advanced",
+  contradiction_detect:  "gemini-3-flash-thinking-advanced",
+  document_review:       "gemini-3-flash-thinking-plus",
+  // High-volume background tasks — speed + cost efficiency
+  batch_enrichment:      "gemini-3-flash-advanced",
+  summary:               "gemini-3-flash-advanced",
+  classify:              "gemini-3-flash-advanced",
+  // Tool-calling tasks — route to thinking model (subscription tier)
+  tool_use:              "gemini-3-flash-thinking-advanced",
+  agentic:               "gemini-3-flash-thinking-advanced",
+};
 
-// NLM grounding: cache notebooks fetched this invocation
-let _nlmCookies = null;
+// ---------- OpenAI-compatible endpoint (AI Gateway Custom Provider) ----------
+// Two paths:
+//   A. tools[] stripped (not supported on subscription), falls through to web-cookie
+//   B. no tools        → web-cookie subscription (Gemini 3, NLM grounding)
+// Cloudflare AI Gateway strips /v1 prefix → registered at /chat/completions.
+async function handleOpenAICompletions(request, env) {
+  let body;
+  try { body = await request.json(); }
+  catch { return jsonResponse({ error: { message: "Request body must be valid JSON.", type: "invalid_request_error" } }, 400); }
 
-// ─── Auth helpers ────────────────────────────────────────────────────────────
+  const { model: reqModel, messages = [], temperature, max_tokens, tools, tool_choice, task_type } = body;
 
-function getAuthMode(env) {
-  // Subscription tier takes priority — gemini-3-* models + NLM grounding
-  // Cookies come from R2_AUTH (shared with NLM worker) or worker secrets
-  if (env.SECURE_1PSID || env.SESSION_KEY || _nlmCookies || env.R2_AUTH || env.NLM) return "web-cookie";
-  // API key fallback — gemini-2.5-* only, no NLM grounding, uses quota
-  if (env.GEMINI_API_KEY) return "gemini-api";
-  if (env.AI) return "workers-ai";
-  return null;
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return jsonResponse({ error: { message: "'messages' must be a non-empty array.", type: "invalid_request_error" } }, 400);
+  }
+
+  // Model selection: explicit model > task_type routing > default
+  const routedModel = TASK_MODEL_MAP[task_type] || null;
+  const geminiModel = GEMINI_MODEL_MAP[reqModel] || reqModel || routedModel || "gemini-3-pro-advanced";
+
+  const created = Math.floor(Date.now() / 1000);
+  const completionId = `chatcmpl-${created}-${Math.random().toString(36).slice(2, 10)}`;
+
+  // ── Path A: tools[] stripped — subscription tier does not support function calling ──
+  if (Array.isArray(tools) && tools.length > 0) {
+    // Drop tool definitions; fall through to web-cookie generate below.
+    body.tools = undefined;
+    body.tool_choice = undefined;
+  }
+
+  // ── Path B: web-cookie subscription (Gemini 3 + NLM grounding) ──
+  const systemParts = messages.filter(m => m.role === "system").map(m => m.content);
+  const userMessages = messages.filter(m => m.role !== "system");
+  const lastUser = userMessages.filter(m => m.role === "user").pop();
+  if (!lastUser) return jsonResponse({ error: { message: "No user message found.", type: "invalid_request_error" } }, 400);
+
+  const prompt = typeof lastUser.content === "string" ? lastUser.content
+    : Array.isArray(lastUser.content) ? lastUser.content.map(p => p.text ?? "").join("") : String(lastUser.content ?? "");
+  const system = systemParts.length > 0 ? systemParts.join("\n\n") : null;
+
+  const generateResp = await handleGenerate(
+    new Request("https://internal/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        prompt,
+        model: geminiModel,
+        system,
+        temperature: temperature ?? undefined,
+        max_tokens: max_tokens ?? undefined,
+        notebooks: true,
+      }),
+    }),
+    env,
+  );
+  const genData = await generateResp.json();
+
+  if (!generateResp.ok) {
+    return jsonResponse({ error: { message: genData.error ?? "Generation failed", type: "server_error" } }, generateResp.status);
+  }
+
+  return jsonResponse({
+    id: completionId,
+    object: "chat.completion",
+    created,
+    model: geminiModel,
+    choices: [{ index: 0, message: { role: "assistant", content: genData.text ?? "" }, finish_reason: "stop" }],
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    _gemini: { auth_mode: genData.auth_mode, model: geminiModel, grounded: genData.grounded },
+  });
 }
 
-/**
- * Build a full cookie string with all auth-related Google cookies.
- * Uses rotated PSIDTS if available, falls back to env secret.
- */
-function buildFullCookieString(env, cookieOverride) {
-  const base = cookieOverride || env.SECURE_1PSID || env.SESSION_KEY || "";
-  if (!base) return "";
-  const parts = [`__Secure-1PSID=${base}`];
-  if (env.SECURE_1PSIDTS) parts.push(`__Secure-1PSIDTS=${env.SECURE_1PSIDTS}`);
-  if (env.SECURE_1PSIDCC) parts.push(`__Secure-1PSIDCC=${env.SECURE_1PSIDCC}`);
-  return parts.join("; ");
+// ─── NLM cache ────────────────────────────────────────────────────────────────
+let _nlmCookies    = null;
+let _cachedPSIDTS  = null;
+let _lastRotateAt  = null;
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function jsonResponse(data, status = 200) {
+  return new Response(JSON.stringify(data, null, 2), {
+    status,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      ...corsHeaders(),
+    },
+  });
 }
 
-/**
- * Fetch with retry logic. Retries on 429 and 5xx with exponential backoff.
- * @param {Fetcher|string} target - Service binding (e.g. env.GOOGLE_AUTH) or URL string
- * @param {Request} request - Request to send (will be cloned on each retry)
- * @param {number} maxRetries - Maximum retry attempts (default: 3)
- */
+function corsHeaders() {
+  return {
+    "Access-Control-Allow-Origin":  "*",
+    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, Mcp-Session-Id, MCP-Protocol-Version",
+    "Access-Control-Expose-Headers":"Mcp-Session-Id, MCP-Protocol-Version",
+  };
+}
+
 async function fetchWithRetry(target, request, maxRetries = 3) {
   let lastErr;
   for (let i = 0; i < maxRetries; i++) {
     try {
       const resp = typeof target === "string"
-        ? await fetch(target, request.clone())
-        : await target.fetch(request.clone());
-      if (resp.status === 429 || resp.status >= 500) {
-        await new Promise(r => setTimeout(r, Math.pow(2, i) * 200));
-        lastErr = new Error(`HTTP ${resp.status}`);
-        continue;
-      }
-      return resp;
+        ? await fetch(target, request.clone ? request.clone() : request)
+        : await target.fetch(request.clone ? request.clone() : request);
+      if (resp.status !== 429 && resp.status < 500) return resp;
+      await new Promise(r => setTimeout(r, Math.pow(2, i) * 200));
+      lastErr = new Error(`HTTP ${resp.status}`);
     } catch (e) {
       lastErr = e;
       await new Promise(r => setTimeout(r, Math.pow(2, i) * 200));
@@ -168,850 +211,938 @@ async function fetchWithRetry(target, request, maxRetries = 3) {
   throw lastErr;
 }
 
-// ─── Cookie refresh from GOOGLE_AUTH binding ─────────────────────────────────
+// ─── Auth helpers ─────────────────────────────────────────────────────────────
 
-async function refreshCookiesFromAuthWorker(env) {
-  if (env.GOOGLE_AUTH) {
-    try {
-      const authResp = await fetchWithRetry(env.GOOGLE_AUTH, new Request("https://google-auth-worker.internal/token", {
-        method: "GET",
-        headers: { "Content-Type": "application/json" },
-      }));
-      if (authResp.ok) {
-        const authData = await authResp.json();
-        if (authData.cookie || authData.SECURE_1PSID) {
-          _nlmCookies = authData.cookie || authData.SECURE_1PSID;
-          return _nlmCookies;
-        }
-      }
-    } catch (e) {
-      console.error("GOOGLE_AUTH refresh failed:", e.message);
-    }
-  }
+function getAuthMode(env) {
+  // Subscription tier takes priority — gemini-3-* models + NLM grounding
+  if (env.SECURE_1PSID || env.SESSION_KEY || _nlmCookies || env.R2_AUTH || env.NLM) return "web-cookie";
+  // Workers AI free fallback
+  if (env.AI) return "workers-ai";
   return null;
 }
 
-async function getActiveCookie(env, cookieOverride) {
-  if (cookieOverride) return cookieOverride;
+async function fetchNLMCookies(env) {
   if (_nlmCookies) return _nlmCookies;
-  // Try refreshing from auth worker
-  const refreshed = await refreshCookiesFromAuthWorker(env);
-  if (refreshed) return refreshed;
-  // Fall back to env secret
+  if (env.GOOGLE_AUTH) {
+    try {
+      const resp = await fetchWithRetry(env.GOOGLE_AUTH, new Request("https://google-auth-worker.internal/token", { method: "GET" }));
+      if (resp.ok) {
+        const data = await resp.json();
+        _nlmCookies = data.cookie || data.SECURE_1PSID || null;
+        return _nlmCookies;
+      }
+    } catch {}
+  }
+  if (env.NLM) {
+    try {
+      const resp = await fetchWithRetry(env.NLM, new Request("https://notebooklm-worker.internal/cookies/gemini", { method: "GET" }));
+      if (resp.ok) {
+        const data = await resp.json();
+        _nlmCookies = data.cookie || data.SECURE_1PSID || null;
+        return _nlmCookies;
+      }
+    } catch {}
+  }
   return env.SECURE_1PSID || env.SESSION_KEY || null;
 }
 
-// ─── NLM grounding helpers ───────────────────────────────────────────────────
+async function rotateCookies(env) {
+  _cachedPSIDTS = null;
+  _nlmCookies = null;
+  _lastRotateAt = Date.now();
+  return fetchNLMCookies(env);
+}
 
-async function fetchNLMContext(env, notebookIds) {
-  if (!env.NLM) return null;
+function buildFullCookieString(baseCookie, psidts, psidcc) {
+  const parts = [`__Secure-1PSID=${baseCookie}`];
+  if (psidts)  parts.push(`__Secure-1PSIDTS=${psidts}`);
+  if (psidcc)  parts.push(`__Secure-1PSIDCC=${psidcc}`);
+  return parts.join("; ");
+}
+
+function buildCookieString(env, cookieOverride) {
+  const base = cookieOverride || _nlmCookies || env.SECURE_1PSID || env.SESSION_KEY;
+  if (!base) return null;
+  return buildFullCookieString(base, _cachedPSIDTS || env.SECURE_1PSIDTS, env.SECURE_1PSIDCC);
+}
+
+function buildModelHeaders(modelId) {
+  return {
+    "x-goog-ext-525001229-jspb": `["${modelId}",null,null,null,""]`,
+  };
+}
+
+// ─── Session / batchExecute helpers ──────────────────────────────────────────
+
+async function getSessionData(env, cookieStr) {
+  // Get SA token (same pattern as before)
+  let saToken = null;
+  if (env.GOOGLE_AUTH) {
+    try {
+      const resp = await fetchWithRetry(env.GOOGLE_AUTH, new Request("https://google-auth-worker.internal/sa-token", { method: "GET" }));
+      if (resp.ok) { const d = await resp.json(); saToken = d.token || null; }
+    } catch {}
+  }
+  return { saToken };
+}
+
+async function batchExecute(cookieStr, payload, env) {
+  const { saToken } = await getSessionData(env, cookieStr);
+  const headers = {
+    "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+    "Cookie": cookieStr,
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "X-Goog-Authuser": "0",
+    ...(saToken ? { "Authorization": `Bearer ${saToken}` } : {}),
+  };
+  const resp = await fetchWithRetry(
+    "https://gemini.google.com/_/BardChatUi/data/batchexecute",
+    new Request("https://gemini.google.com/_/BardChatUi/data/batchexecute?rpcids=CF5qKf&source-path=/&bl=boq_assistant-bard-web-server&hl=en&soc-app=1&soc-platform=1&soc-device=1&_reqid=1&rt=c", {
+      method: "POST",
+      headers,
+      body: payload,
+    }),
+  );
+  return resp;
+}
+
+function parseBatchResponse(raw) {
   try {
-    const url = notebookIds?.length
-      ? `https://notebooklm-worker.internal/sources?ids=${notebookIds.join(",")}`
-      : "https://notebooklm-worker.internal/sources/top?limit=5";
-    const resp = await fetchWithRetry(env.NLM, new Request(url));
-    if (!resp.ok) return null;
+    const lines = raw.split("\n");
+    for (const line of lines) {
+      if (line.startsWith("[[")) {
+        const outer = JSON.parse(line);
+        for (const item of outer) {
+          if (item[0] === "wrb.fr" && item[2]) {
+            return JSON.parse(item[2]);
+          }
+        }
+      }
+    }
+  } catch {}
+  return null;
+}
+
+function parseStreamResponse(parsed) {
+  if (!parsed) return { text: "", thoughts: null, images: [], session: {} };
+
+  let text = "", thoughts = null, images = [], session = {};
+  try {
+    // Extract text from candidate
+    const candidates = parsed[4]?.[0];
+    if (candidates) {
+      const parts = candidates[1]?.[0] ?? [];
+      for (const part of parts) {
+        if (typeof part[1] === "string") {
+          if (part[3]?.includes?.("thoughts")) thoughts = part[1];
+          else text += part[1];
+        }
+        if (Array.isArray(part[4])) {
+          for (const img of part[4]) {
+            if (img[0]?.url) images.push({ url: img[0].url, alt: img[0].alt ?? "" });
+          }
+        }
+      }
+      session.cid = parsed[1]?.[0] ?? null;
+      session.rid = parsed[4]?.[0]?.[0] ?? null;
+      session.mid = parsed[4]?.[0]?.[1]?.[0]?.[0] ?? null;
+    }
+  } catch {}
+  return { text: text.trim(), thoughts, images, session };
+}
+
+// ─── NLM tool proxy ───────────────────────────────────────────────────────────
+
+async function nlmTool(env, action, params = {}) {
+  if (!env.NLM) return { error: "NLM binding not configured" };
+  try {
+    const resp = await fetchWithRetry(env.NLM, new Request(`https://notebooklm-worker.internal/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: action, arguments: params } }),
+    }));
+    if (!resp.ok) return { error: `NLM HTTP ${resp.status}` };
     const data = await resp.json();
-    if (!data?.sources?.length) return null;
-    return data.sources.map(s => `[${s.title}]\n${s.content}`).join("\n\n---\n\n");
+    return data.result ?? data.error ?? data;
   } catch (e) {
-    console.error("NLM grounding fetch failed:", e.message);
-    return null;
+    return { error: e.message };
   }
 }
 
-async function fetchDriveContext(env, driveFileIds) {
-  if (!env.GWS || !driveFileIds?.length) return null;
+async function buildNotebookContext(env, { notebookIds, maxSources = 5, temporary = false } = {}) {
+  if (!env.NLM) return "";
+  try {
+    const url = notebookIds?.length
+      ? `https://notebooklm-worker.internal/sources?ids=${notebookIds.join(",")}&limit=${maxSources}`
+      : `https://notebooklm-worker.internal/sources/top?limit=${maxSources}`;
+    const resp = await fetchWithRetry(env.NLM, new Request(url));
+    if (!resp.ok) return "";
+    const data = await resp.json();
+    if (!data?.sources?.length) return "";
+    return data.sources.map(s => `### ${s.title}\n${s.content}`).join("\n\n---\n\n");
+  } catch {
+    return "";
+  }
+}
+
+// ─── NLM write tools ──────────────────────────────────────────────────────────
+
+async function nlmWriteTool(env, action, params) {
+  return nlmTool(env, `nlm_${action}`, params);
+}
+
+async function nlmAsk(env, { notebookId, question }) {
+  if (!env.NLM) return { error: "NLM binding not configured" };
+  try {
+    const resp = await fetchWithRetry(env.NLM, new Request(
+      `https://notebooklm-worker.internal/notebooks/${notebookId}/ask`,
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ question }) },
+    ));
+    return resp.ok ? resp.json() : { error: `NLM HTTP ${resp.status}` };
+  } catch (e) { return { error: e.message }; }
+}
+
+async function nlmAddSource(env, { notebookId, url, content, title }) {
+  return nlmWriteTool(env, "add_source", { notebook_id: notebookId, url, content, title });
+}
+
+async function nlmAddTextSource(env, { notebookId, content, title }) {
+  return nlmWriteTool(env, "add_source", { notebook_id: notebookId, content, title });
+}
+
+async function nlmCreateNotebook(env, { title }) {
+  return nlmWriteTool(env, "create_notebook", { title });
+}
+
+async function nlmGenerateArtifact(env, { notebookId, artifactType, instructions }) {
+  return nlmWriteTool(env, "generate_artifact", { notebook_id: notebookId, artifact_type: artifactType, instructions });
+}
+
+async function nlmStartResearch(env, { notebookId, topic }) {
+  return nlmWriteTool(env, "start_research", { notebook_id: notebookId, topic });
+}
+
+async function nlmCreateNote(env, { notebookId, title, content }) {
+  return nlmWriteTool(env, "create_note", { notebook_id: notebookId, title, content });
+}
+
+async function nlmHealthCheck(env) {
+  if (!env.NLM) return { ok: false, error: "NLM binding not configured" };
+  try {
+    const resp = await fetchWithRetry(env.NLM, new Request("https://notebooklm-worker.internal/health"));
+    return resp.ok ? resp.json() : { ok: false, status: resp.status };
+  } catch (e) { return { ok: false, error: e.message }; }
+}
+
+async function nlmCreateLinkedDoc(env, { notebookId, title, content }) {
+  return nlmWriteTool(env, "create_linked_doc", { notebook_id: notebookId, title, content });
+}
+
+async function nlmCreateLinkedSheet(env, { notebookId, title, initialData }) {
+  return nlmWriteTool(env, "create_linked_sheet", { notebook_id: notebookId, title, initial_data: initialData });
+}
+
+async function nlmAppendToDoc(env, { docId, text, sourceId }) {
+  return nlmWriteTool(env, "append_doc", { doc_id: docId, text, source_id: sourceId });
+}
+
+async function nlmAppendToSheet(env, { sheetId, rows, sourceId, range }) {
+  return nlmWriteTool(env, "append_sheet", { sheet_id: sheetId, rows, source_id: sourceId, range });
+}
+
+async function nlmSyncAllDocs(env) {
+  return nlmWriteTool(env, "sync_all", {});
+}
+
+// ─── GWS tool proxy ───────────────────────────────────────────────────────────
+
+async function gwsTool(env, toolName, params = {}) {
+  if (!env.GWS) return { error: "GWS binding not configured" };
+  try {
+    const resp = await fetchWithRetry(env.GWS, new Request("https://gws-worker.internal/mcp", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: toolName, arguments: params } }),
+    }));
+    if (!resp.ok) return { error: `GWS HTTP ${resp.status}` };
+    const data = await resp.json();
+    return data.result ?? data.error ?? data;
+  } catch (e) { return { error: e.message }; }
+}
+
+async function gwsDocsAppend(env, { docId, text }) {
+  return gwsTool(env, "gws_docs", { action: "append", document_id: docId, text });
+}
+
+async function buildDriveContext(env, driveFileIds) {
+  if (!env.GWS || !driveFileIds?.length) return "";
   try {
     const resp = await fetchWithRetry(env.GWS, new Request(
       `https://gws-worker.internal/drive/files?ids=${driveFileIds.join(",")}`,
     ));
-    if (!resp.ok) return null;
+    if (!resp.ok) return "";
     const data = await resp.json();
-    if (!data?.files?.length) return null;
-    return data.files.map(f => `[${f.name}]\n${f.content}`).join("\n\n---\n\n");
-  } catch (e) {
-    console.error("Drive context fetch failed:", e.message);
-    return null;
-  }
+    if (!data?.files?.length) return "";
+    return data.files.map(f => `### ${f.name}\n${f.content}`).join("\n\n---\n\n");
+  } catch { return ""; }
 }
 
-// ─── Response helpers ────────────────────────────────────────────────────────
-
-function jsonResponse(data, status = 200) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: {
-      "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Headers": "Authorization, Content-Type",
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    },
-  });
+// ─── generateViaOfficialAPI stub ──────────────────────────────────────────────
+async function generateViaOfficialAPI() {
+  throw new Error("API key auth removed — subscription tier only. Use web-cookie (gemini-3-*) path.");
 }
 
-function sseResponse(stream) {
-  return new Response(stream, {
-    headers: {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      "Access-Control-Allow-Origin": "*",
-    },
-  });
-}
+// ─── Main generate via Gemini web (subscription) ─────────────────────────────
 
-// ─── Gemini web-cookie generate (subscription tier) ──────────────────────────
-
-async function generateViaCookie(prompt, env, {
-  model = DEFAULT_MODEL,
-  system = null,
-  chatMeta = null,
+async function generateViaWebCookie(prompt, env, {
+  model       = "gemini-3-flash",
+  system      = null,
+  gem         = null,
+  chatMeta    = null,
+  temporary   = false,
   cookieOverride = null,
   temperature = null,
-  maxTokens = null,
+  maxTokens   = null,
 } = {}) {
-  const cookie = await getActiveCookie(env, cookieOverride);
-  if (!cookie) throw new Error("No cookie available for web-cookie auth");
+  const baseCookie = cookieOverride || await fetchNLMCookies(env);
+  if (!baseCookie) throw new Error("No cookie available. Configure GOOGLE_AUTH or NLM binding, or set SECURE_1PSID secret.");
 
-  const webModel = GEMINI_WEB_MODELS[model] || GEMINI_WEB_MODELS[DEFAULT_MODEL];
-  const [cid, rid, mid] = chatMeta || [null, null, null];
+  const cookieStr = buildCookieString(env, baseCookie);
+  const webModel  = WEB_MODELS[model] ?? WEB_MODELS["gemini-3-flash"];
 
-  const innerPayload = {
-    prompt: system ? `${system}\n\n${prompt}` : prompt,
-    model: webModel.id,
-    ...(cid && { conversation_id: cid }),
-    ...(rid && { response_id: rid }),
-    ...(mid && { choice_id: mid }),
-    ...(temperature !== null && { temperature }),
-    ...(maxTokens !== null && { max_output_tokens: maxTokens }),
-  };
+  const fullPrompt = system ? `${system}\n\n${prompt}` : prompt;
 
-  const resp = await fetchWithRetry(
-    "https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate",
-    new Request("https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Cookie": buildFullCookieString(env, cookie),
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        "X-Goog-Authuser": "0",
-      },
-      body: `f.req=${encodeURIComponent(JSON.stringify([null, JSON.stringify([innerPayload])]))}`,
-    }),
-  );
+  const [cid, rid, mid] = chatMeta ?? [null, null, null];
+  const inner = JSON.stringify([
+    [fullPrompt, 0, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    null,
+    cid ? [cid, rid, mid] : null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    temporary ? 1 : 0,
+  ]);
 
-  if (!resp.ok) throw new Error(`Gemini web returned ${resp.status}`);
-  const raw = await resp.text();
+  const payload = new URLSearchParams({
+    "f.req": JSON.stringify([[["CF5qKf", inner, null, "generic"]]]),
+    "at": "",
+  }).toString();
 
-  // Parse the streaming response format
-  let text = "", thoughts = null, images = [], candidates = [], session = {};
-  try {
-    const chunks = raw.split("\n").filter(l => l.startsWith("["));
-    for (const chunk of chunks) {
-      try {
-        const parsed = JSON.parse(chunk);
-        const inner = parsed?.[0]?.[2];
-        if (!inner) continue;
-        const data = JSON.parse(inner);
-        // Extract text
-        const candidate = data?.[4]?.[0];
-        if (candidate) {
-          const parts = candidate[1]?.[0] || [];
-          for (const part of parts) {
-            if (typeof part[1] === "string") text += part[1];
-            if (part[3]?.includes("thoughts")) thoughts = part[1];
-          }
-          // Session continuity
-          if (data[1]) session.cid = data[1][0];
-          if (data[4]?.[0]?.[0]) session.rid = data[4][0][0];
-          if (data[4]?.[0]?.[1]?.[0]) session.mid = data[4][0][1][0][0];
-        }
-      } catch {}
+  const resp = await batchExecute(cookieStr, payload, env);
+  if (!resp.ok) {
+    if (resp.status === 401 || resp.status === 403) {
+      _nlmCookies = null;
+      throw new Error(`Cookie auth failed (${resp.status}). Trigger a refresh via POST /rotate.`);
     }
-  } catch (e) {
-    console.error("Response parse error:", e.message);
+    throw new Error(`Gemini web HTTP ${resp.status}`);
   }
 
-  return { text: text.trim(), thoughts, images, candidates, session, model, auth_mode: "web-cookie" };
+  const raw    = await resp.text();
+  const parsed = parseBatchResponse(raw);
+  const result = parseStreamResponse(parsed);
+
+  return {
+    ...result,
+    model,
+    auth_mode: "web-cookie",
+  };
 }
 
-// ─── Gemini official API generate (API-key tier) ─────────────────────────────
-
-async function generateViaOfficialAPI(prompt, env, { model = "gemini-2.5-flash", system = null } = {}) {
-  const apiModel = GEMINI_API_MODELS[model] || model;
-  const reqBody = { contents: [{ role: "user", parts: [{ text: prompt }] }] };
-  if (system) reqBody.system_instruction = { parts: [{ text: system }] };
-
-  const endpoints = [];
-  if (env.GEMINI_API_KEY) {
-    endpoints.push({ url: `${GEMINI_GW}/${apiModel}:generateContent`, auth: `Bearer ${env.GEMINI_API_KEY}`, label: "gateway" });
-    endpoints.push({ url: `${GEMINI_DIRECT}/${apiModel}:generateContent?key=${env.GEMINI_API_KEY}`, auth: null, label: "direct-key" });
-  }
-  if (!endpoints.length) throw new Error("No API key configured");
-
-  let lastErr;
-  for (const ep of endpoints) {
-    try {
-      const headers = { "Content-Type": "application/json" };
-      if (ep.auth) headers["Authorization"] = ep.auth;
-      const resp = await fetchWithRetry(ep.url, new Request(ep.url, {
-        method: "POST", headers, body: JSON.stringify(reqBody),
-      }));
-      if (!resp.ok) { lastErr = new Error(`${ep.label}: HTTP ${resp.status}`); continue; }
-      const data = await resp.json();
-      const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
-      return { text, mode: `gemini-api (${ep.label})`, model };
-    } catch (e) { lastErr = e; }
-  }
-  throw lastErr || new Error("All API endpoints failed");
-}
-
-// ─── Workers AI fallback ──────────────────────────────────────────────────────
-
-async function generateViaWorkersAI(prompt, env, { model = "@cf/meta/llama-3.1-8b-instruct" } = {}) {
-  if (!env.AI) throw new Error("Workers AI binding not available");
+async function generateViaWorkersAI(prompt, env, { model = "@cf/google/gemma-3-12b-it" } = {}) {
+  if (!env.AI) throw new Error("Workers AI binding (AI) not configured.");
   const result = await env.AI.run(model, {
     messages: [{ role: "user", content: prompt }],
-    gateway: env.AI_GATEWAY ? { id: env.AI_GATEWAY_ID || "automation-hub" } : undefined,
   });
-  return { text: result.response || "", mode: "workers-ai", model };
+  return { text: result.response ?? "", model, auth_mode: "workers-ai" };
 }
 
-// ─── NLM-grounded generate ────────────────────────────────────────────────────
+// ─── handleGenerate ───────────────────────────────────────────────────────────
 
 async function handleGenerate(request, env) {
-  let body = {};
-  try { body = await request.json(); } catch {}
+  let body;
+  try { body = await request.json(); }
+  catch { return jsonResponse({ error: "Request body must be valid JSON." }, 400); }
 
   const {
-    prompt, model = DEFAULT_MODEL, system = null,
-    notebooks = true, notebook_ids = null, drive_file_ids = null,
-    gem = null, temperature = null, max_tokens = null,
-    chat_meta = null, stream = false, cookie = null,
+    prompt,
+    model         = "gemini-3-flash",
+    system        = null,
+    gem           = null,
+    chat_meta     = null,
+    temporary     = false,
+    notebooks     = true,
+    notebook_ids  = null,
+    max_sources   = 5,
+    drive_file_ids= null,
+    temperature   = null,
+    max_tokens    = null,
+    cookie        = null,
   } = body;
 
-  if (!prompt) return jsonResponse({ error: "prompt required" }, 400);
-
-  // Build grounding context
-  let groundingContext = "";
-  if (notebooks) {
-    const [nlmCtx, driveCtx] = await Promise.all([
-      fetchNLMContext(env, notebook_ids),
-      fetchDriveContext(env, drive_file_ids),
-    ]);
-    if (nlmCtx) groundingContext += nlmCtx;
-    if (driveCtx) groundingContext += (groundingContext ? "\n\n---\n\n" : "") + driveCtx;
-  }
-
-  const gemText = gem && typeof gem === "string" ? gem : null;
-  const fullSystem = [system, gemText, groundingContext ? `Context:\n${groundingContext}` : null]
-    .filter(Boolean).join("\n\n") || null;
+  if (!prompt) return jsonResponse({ error: "'prompt' is required." }, 400);
 
   const authMode = getAuthMode(env);
   if (!authMode) return jsonResponse({
-    error: "No auth configured. Set SECURE_1PSID/SESSION_KEY or configure GOOGLE_AUTH/NLM service bindings.",
-    hint: "Set GEMINI_API_KEY or configure GOOGLE_AUTH/NLM service bindings."
+    error: "No auth configured.",
+    hint: "Set SECURE_1PSID or SESSION_KEY secret, or configure GOOGLE_AUTH/NLM bindings.",
   }, 503);
 
-  const apiSystem = gem && authMode === "gemini-api" ? [fullSystem, typeof gem === "string" ? gem : null].filter(Boolean).join("\n\n") || null : fullSystem;
+  // Build grounding context (non-blocking)
+  let notebookContext = "";
+  let driveContext    = "";
+  if (notebooks !== false) {
+    [notebookContext, driveContext] = await Promise.all([
+      buildNotebookContext(env, { notebookIds: notebook_ids, maxSources: max_sources, temporary }),
+      buildDriveContext(env, drive_file_ids),
+    ]);
+  }
+
+  const fullSystem = [system, gem, notebookContext, driveContext]
+    .filter(Boolean).join("\n\n---\n\n") || null;
+  const apiSystem = fullSystem;
 
   try {
     let result;
     if (authMode === "web-cookie") {
-      result = await generateViaCookie(prompt, env, {
-        model, system: fullSystem, chatMeta: chat_meta,
-        cookieOverride: cookie, temperature, maxTokens: max_tokens,
-      });
-    } else if (authMode === "gemini-api") {
-      result = await generateViaOfficialAPI(prompt, env, {
-        model, system: apiSystem,
+      result = await generateViaWebCookie(prompt, env, {
+        model, system: fullSystem, gem, chatMeta: chat_meta,
+        temporary, cookieOverride: cookie, temperature, maxTokens: max_tokens,
       });
     } else if (authMode === "workers-ai") {
       result = await generateViaWorkersAI(prompt, env);
     } else {
-      return jsonResponse({ error: "No auth configured. Set GEMINI_API_KEY or configure GOOGLE_AUTH/NLM service bindings.", hint: "Run 'notebooklm login' or add GEMINI_API_KEY secret." }, 500);
+      return jsonResponse({ error: "No auth available." }, 503);
     }
+
+    // Omit session object from result (just expose ids)
+    const { session, ...rest } = result;
     return jsonResponse({
-      ...result,
-      grounded: !!groundingContext,
-      auth_mode: authMode
+      ...rest,
+      ...(session ? { cid: session.cid, rid: session.rid, mid: session.mid } : {}),
+      grounded: !!(notebookContext || driveContext),
+      auth_mode: authMode,
+      _meta: { task_type: body.task_type ?? null },
     });
   } catch (err) {
-    return jsonResponse({ error: err.message, mode: authMode, hint: "If cookies expired, run 'notebooklm login' to refresh auth in R2." }, 500);
+    return jsonResponse({ error: err.message, mode: authMode, hint: "If cookies expired, POST /rotate to refresh." }, 500);
   }
 }
 
-// ─── Streaming generate ───────────────────────────────────────────────────────
+// ─── handleGenerateStream ─────────────────────────────────────────────────────
 
-async function handleStream(request, env) {
-  let body = {};
-  if (request.method === "POST") {
-    try { body = await request.json(); } catch {}
-  } else {
-    const url = new URL(request.url);
-    body.prompt = url.searchParams.get("prompt") || "";
-    body.model = url.searchParams.get("model") || DEFAULT_MODEL;
-  }
-  const { prompt, model = DEFAULT_MODEL, system = null } = body;
-  if (!prompt) return jsonResponse({ error: "prompt required" }, 400);
+async function handleGenerateStream(request, env) {
+  let body;
+  try { body = await request.json(); }
+  catch { return jsonResponse({ error: "Request body must be valid JSON." }, 400); }
 
   const authMode = getAuthMode(env);
-  if (authMode !== "web-cookie" && authMode !== "gemini-api")
-    return jsonResponse({ error: "Streaming requires GEMINI_API_KEY or web-cookie auth (GOOGLE_AUTH/NLM binding)." }, 400);
+  if (authMode !== "web-cookie")
+    return jsonResponse({ error: "Streaming requires web-cookie auth. Ensure SECURE_1PSID/SESSION_KEY or GOOGLE_AUTH/NLM binding is configured." }, 400);
+
+  const { prompt, model = "gemini-3-flash", system = null } = body;
+  if (!prompt) return jsonResponse({ error: "'prompt' is required." }, 400);
 
   const { readable, writable } = new TransformStream();
-  const writer = writable.getWriter();
+  const writer  = writable.getWriter();
   const encoder = new TextEncoder();
+
+  async function send(event, data) {
+    await writer.write(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+  }
 
   (async () => {
     try {
-      if (authMode === "gemini-api") {
-        const result = await generateViaOfficialAPI(prompt, env, { model: model ?? "gemini-2.5-flash", system });
-        await writer.write(encoder.encode(`data: ${JSON.stringify({ text: result.text, done: false })}\n\n`));
-        await writer.write(encoder.encode(`data: ${JSON.stringify({ done: true })}\n\n`));
-      } else {
-        // web-cookie streaming: simulate with single response
-        const result = await generateViaCookie(prompt, env, { model, system });
-        const words = result.text.split(" ");
-        for (let i = 0; i < words.length; i += 5) {
-          const chunk = words.slice(i, i + 5).join(" ");
-          await writer.write(encoder.encode(`data: ${JSON.stringify({ text: chunk, done: false })}\n\n`));
-        }
-        await writer.write(encoder.encode(`data: ${JSON.stringify({ done: true, session: result.session })}\n\n`));
-      }
+      const result = await generateViaWebCookie(prompt, env, { model, system });
+      await send("chunk", { text: result.text });
+      await send("done",  { session: result.session, model, auth_mode: "web-cookie" });
     } catch (e) {
-      await writer.write(encoder.encode(`data: ${JSON.stringify({ error: e.message, done: true })}\n\n`));
+      await send("error", { error: e.message });
     } finally {
       await writer.close();
     }
   })();
 
-  return sseResponse(readable);
+  return new Response(readable, {
+    headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders() },
+  });
 }
 
-// ─── Multi-turn chat ──────────────────────────────────────────────────────────
+// ─── Gem management ───────────────────────────────────────────────────────────
 
-async function handleChat(request, env) {
-  if (getAuthMode(env) !== "web-cookie")
-    return jsonResponse({ error: "Gemini chat requires web-cookie auth (subscription tier)." }, 400);
-
-  let body = {};
-  try { body = await request.json(); } catch {}
-  const { prompt, model = DEFAULT_MODEL, system = null, chat_meta = null, cookie = null } = body;
-  if (!prompt) return jsonResponse({ error: "prompt required" }, 400);
-
-  const result = await generateViaCookie(prompt, env, { model, system, chatMeta: chat_meta, cookieOverride: cookie });
-  return jsonResponse(result);
-}
-
-// ─── Gem personas ─────────────────────────────────────────────────────────────
-
-async function handleGems(request, env, gemId) {
-  const cookie = await getActiveCookie(env, null);
-  if (!cookie) return jsonResponse({ error: "web-cookie auth required for Gems" }, 401);
-
-  if (request.method === "GET") {
-    // List available gems — fetched from Gemini web
-    return jsonResponse({ gems: [], note: "Gem listing requires scraping; use POST /gems/:id to invoke" });
-  }
-
-  let body = {};
-  try { body = await request.json(); } catch {}
-  const { prompt, system = null } = body;
-  if (!prompt) return jsonResponse({ error: "prompt required" }, 400);
-
-  const result = await generateViaCookie(prompt, env, { model: DEFAULT_MODEL, system, gem: gemId });
-  return jsonResponse(result);
-}
-
-// ─── Workspace relay ──────────────────────────────────────────────────────────
-
-const WORKSPACE_ACTIONS = {
-  send_email:     { binding: "GWS", path: "/gmail/send" },
-  search_email:   { binding: "GWS", path: "/gmail/search" },
-  create_event:   { binding: "GWS", path: "/calendar/events" },
-  list_events:    { binding: "GWS", path: "/calendar/events" },
-  create_task:    { binding: "GWS", path: "/tasks/create" },
-  list_tasks:     { binding: "GWS", path: "/tasks" },
-  read_doc:       { binding: "GWS", path: "/docs/read" },
-  create_doc:     { binding: "GWS", path: "/docs/create" },
-  read_sheet:     { binding: "GWS", path: "/sheets/read" },
-  write_sheet:    { binding: "GWS", path: "/sheets/write" },
-  list_drive:     { binding: "GWS", path: "/drive/list" },
-  upload_drive:   { binding: "GWS", path: "/drive/upload" },
-};
-const ALIASES = {
-  search_gmail: "search_email", search_mail: "search_email", find_email: "search_email",
-  schedule_meeting: "create_event", add_event: "create_event",
-};
-
-async function handleWorkspaceAction(env, action, params) {
-  const rawAction = action;
-  const resolvedAction = ALIASES[rawAction] || rawAction;
-  const spec = WORKSPACE_ACTIONS[resolvedAction];
-
-  if (!spec) {
-    return { success: false, error: `Unknown action: ${rawAction}`, available: Object.keys(WORKSPACE_ACTIONS) };
-  }
-  const binding = env[spec.binding];
-  if (!binding) {
-    return { success: false, error: `${spec.binding} binding not configured` };
-  }
-
+async function handleGetGems(env) {
+  if (!env.NLM) return jsonResponse({ error: "NLM binding required for Gem management." }, 503);
   try {
-    const resp = await fetchWithRetry(binding, new Request(`https://${spec.binding.toLowerCase()}-worker.internal${spec.path}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(params),
-    }));
-    const data = await resp.json();
-    return { success: resp.ok, ...data };
-  } catch (e) {
-    return { success: false, error: e.message };
+    const resp = await fetchWithRetry(env.NLM, new Request("https://notebooklm-worker.internal/gems"));
+    return resp.ok ? new Response(resp.body, { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders() } }) : jsonResponse({ error: `NLM ${resp.status}` }, resp.status);
+  } catch (e) { return jsonResponse({ error: e.message }, 500); }
+}
+
+async function handleCreateGem(request, env) {
+  const body = await request.json().catch(() => ({}));
+  return nlmWriteTool(env, "create_gem", body).then(r => jsonResponse(r));
+}
+
+async function handleUpdateGem(request, env, gemId) {
+  const body = await request.json().catch(() => ({}));
+  return nlmWriteTool(env, "update_gem", { id: gemId, ...body }).then(r => jsonResponse(r));
+}
+
+async function handleDeleteGem(request, env, gemId) {
+  return nlmWriteTool(env, "delete_gem", { id: gemId }).then(r => jsonResponse(r));
+}
+
+// ─── NLM REST handler ─────────────────────────────────────────────────────────
+
+async function handleNLM(request, env) {
+  let body = {};
+  try { body = await request.json(); } catch {}
+  const { action, ...params } = body;
+  switch (action) {
+    case "ask":               return jsonResponse(await nlmAsk(env, params));
+    case "add_source":        return jsonResponse(await nlmAddSource(env, params));
+    case "add_text_source":   return jsonResponse(await nlmAddTextSource(env, params));
+    case "create_notebook":   return jsonResponse(await nlmCreateNotebook(env, params));
+    case "create_linked_doc": return jsonResponse(await nlmCreateLinkedDoc(env, params));
+    case "create_linked_sheet":return jsonResponse(await nlmCreateLinkedSheet(env, params));
+    case "append_doc":        return jsonResponse(await nlmAppendToDoc(env, params));
+    case "append_sheet":      return jsonResponse(await nlmAppendToSheet(env, params));
+    case "sync_all":          return jsonResponse(await nlmSyncAllDocs(env));
+    case "generate_artifact": return jsonResponse(await nlmGenerateArtifact(env, params));
+    case "health":            return jsonResponse(await nlmHealthCheck(env));
+    default: return jsonResponse({ error: `Unknown NLM action: ${action}`, available: ["ask","add_source","create_notebook","create_linked_doc","create_linked_sheet","append_doc","append_sheet","sync_all","generate_artifact","health"] }, 400);
   }
 }
+
+// ─── Workspace handlers ───────────────────────────────────────────────────────
 
 async function handleWorkspaceChat(request, env) {
   let body = {};
   try { body = await request.json(); } catch {}
-  const { message, actions = [], context = {} } = body;
+  const { message, context = {}, action, params = {} } = body;
 
-  const results = [];
-  for (const { action, params = {} } of actions) {
-    const result = await handleWorkspaceAction(env, action, { ...params, ...context });
-    results.push({ action, result });
+  if (action) {
+    const result = await gwsTool(env, `gws_${action}`, { ...params, ...context });
+    return jsonResponse({ workspace_result: result });
   }
 
-  if (message) {
-    const contextStr = results.length
-      ? `Workspace results:\n${results.map(r => `${r.action}: ${JSON.stringify(r.result)}`).join("\n")}`
-      : "";
-    const geminiResult = await handleGenerate(
-      new Request("https://internal/generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: message, system: contextStr || undefined }),
-      }),
-      env,
-    );
-    const geminiData = await geminiResult.json();
-    return jsonResponse({ message: geminiData.text, workspace_results: results, auth_mode: geminiData.auth_mode });
-  }
+  if (!message) return jsonResponse({ error: "message or action required" }, 400);
+  const generateResp = await handleGenerate(
+    new Request("https://internal/generate", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt: message, ...context }),
+    }),
+    env,
+  );
+  return generateResp;
+}
 
-  return jsonResponse({ workspace_results: results });
+function extractActionJson(text) {
+  const m = text.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/);
+  if (m) { try { return JSON.parse(m[1]); } catch {} }
+  try { return JSON.parse(text); } catch {}
+  return null;
+}
+
+async function handleWorkspaceRun(request, env) {
+  let body = {};
+  try { body = await request.json(); } catch {}
+  const { instructions, context = {} } = body;
+  if (!instructions) return jsonResponse({ error: "instructions required" }, 400);
+
+  const planResp = await handleGenerate(new Request("https://internal/generate", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      prompt: instructions,
+      system: "You are a workspace automation agent. Respond with a JSON action plan: { action, params }. Available GWS tools: gmail, drive, calendar, docs, sheets, tasks, contacts.",
+      model: "gemini-3-flash-thinking-advanced",
+    }),
+  }), env);
+  const planData = await planResp.json();
+  const plan = extractActionJson(planData.text ?? "");
+  if (!plan) return jsonResponse({ error: "Could not parse action plan", raw: planData.text }, 500);
+
+  const result = await gwsTool(env, `gws_${plan.action}`, plan.params ?? {});
+  return jsonResponse({ plan, result });
+}
+
+async function handleGeminiNotebook(request, env) {
+  let body = {};
+  try { body = await request.json(); } catch {}
+  const { notebook_id, question, model = "gemini-3-pro-advanced" } = body;
+  if (!notebook_id || !question) return jsonResponse({ error: "notebook_id and question required" }, 400);
+
+  const [nlmResp, geminiResp] = await Promise.all([
+    nlmAsk(env, { notebookId: notebook_id, question }),
+    handleGenerate(new Request("https://internal/generate", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt: question, model, notebook_ids: [notebook_id] }),
+    }), env),
+  ]);
+  const geminiData = await geminiResp.json();
+  return jsonResponse({ nlm: nlmResp, gemini: geminiData });
+}
+
+async function handleWorkspaceExecute(request, env) {
+  let body = {};
+  try { body = await request.json(); } catch {}
+  const { tool, params = {} } = body;
+  if (!tool) return jsonResponse({ error: "tool required" }, 400);
+  const result = await gwsTool(env, tool, params);
+  return jsonResponse({ tool, result });
+}
+
+async function handleGWS(request, env) {
+  let body = {};
+  try { body = await request.json(); } catch {}
+  const { tool, action, params = {} } = body;
+  const toolName = tool || (action ? `gws_${action}` : null);
+  if (!toolName) return jsonResponse({ error: "tool or action required" }, 400);
+  return jsonResponse(await gwsTool(env, toolName, params));
+}
+
+// ─── GWS auth helpers (legacy) ────────────────────────────────────────────────
+
+function getGWSKey(env) {
+  return env.SECURE_1PSID || env.SESSION_KEY || _nlmCookies || null;
+}
+
+function gwsHeaders(env) {
+  const key = getGWSKey(env);
+  return key ? { Cookie: `__Secure-1PSID=${key}` } : {};
 }
 
 // ─── MCP server ───────────────────────────────────────────────────────────────
 
-const MCP_TOOLS = [
+const OWN_MCP_TOOLS = [
   {
-    name: "gemini_generate",
-    description: "Generate text using Gemini (subscription tier: gemini-3-* models with NLM grounding)",
+    name: "gemini",
+    description: `Gemini AI with NotebookLM grounding and Drive file context.
+
+Actions: generate, gems
+
+- generate: prompt (required), model, system, gem (Gem ID for persona), notebooks (bool, default true), notebook_ids (array), drive_file_ids (array), chat_meta (array for multi-turn). Use @YouTube/@Gmail/@Maps in prompt for extensions.
+- gems: action (list/create/update/delete), id (for update/delete), name, prompt (system instructions), description`,
     inputSchema: {
       type: "object",
       properties: {
-        prompt: { type: "string", description: "The prompt to send to Gemini" },
-        model: { type: "string", description: "Model name (default: gemini-3-flash)", default: DEFAULT_MODEL },
-        system: { type: "string", description: "System prompt / instructions" },
-        notebooks: { type: "boolean", description: "Enable NLM notebook grounding (default: true)", default: true },
-        notebook_ids: { type: "array", items: { type: "string" }, description: "Specific notebook IDs to ground from" },
-        drive_file_ids: { type: "array", items: { type: "string" }, description: "Drive file IDs to inject as context" },
-        gem: { type: "string", description: "Gem persona ID or instructions" },
-        temperature: { type: "number", description: "Sampling temperature" },
-        max_tokens: { type: "number", description: "Maximum output tokens" },
-      },
-      required: ["prompt"],
-    },
-  },
-  {
-    name: "gemini_chat",
-    description: "Multi-turn chat with Gemini (web-cookie/subscription tier only)",
-    inputSchema: {
-      type: "object",
-      properties: {
-        prompt: { type: "string" },
-        model: { type: "string", default: DEFAULT_MODEL },
-        system: { type: "string" },
-        chat_meta: { type: "array", items: { type: "string" }, description: "[cid, rid, mid] for conversation continuity" },
-      },
-      required: ["prompt"],
-    },
-  },
-  {
-    name: "workspace_action",
-    description: "Execute a Google Workspace action (send email, create calendar event, read Drive file, etc.)",
-    inputSchema: {
-      type: "object",
-      properties: {
-        action: { type: "string", enum: Object.keys(WORKSPACE_ACTIONS), description: "Workspace action to execute" },
-        params: { type: "object", description: "Action-specific parameters" },
+        action:         { type: "string", enum: ["generate", "gems"] },
+        prompt:         { type: "string" },
+        model:          { type: "string", enum: Object.keys(WEB_MODELS) },
+        system:         { type: "string" },
+        gem:            { type: "string" },
+        notebooks:      { type: "boolean" },
+        notebook_ids:   { type: "array", items: { type: "string" } },
+        drive_file_ids: { type: "array", items: { type: "string" } },
+        chat_meta:      { type: "array" },
+        id:             { type: "string" },
+        name:           { type: "string" },
+        description:    { type: "string" },
       },
       required: ["action"],
     },
   },
   {
-    name: "gws_generate",
-    description: "Generate Gemini response grounded in Google Workspace data (Drive, Docs, Sheets)",
+    name: "nlm_workflow",
+    description: `LIVE NotebookLM operations — query, create notebooks, add sources, generate artifacts, export.
+
+Actions: ask, add_source, create_notebook, create_linked_doc, create_linked_sheet, append_doc, append_sheet, sync_all, generate_artifact, health
+
+- ask: notebook_id + question (required)
+- add_source: notebook_id (required), url or content, title
+- create_notebook: title
+- create_linked_doc: notebook_id + title (required), content
+- create_linked_sheet: notebook_id + title (required), initial_data (2D array)
+- append_doc: doc_id + text (required), source_id
+- append_sheet: sheet_id + rows (required), source_id, range
+- sync_all: sync all stale living docs
+- generate_artifact: notebook_id + artifact_type (audio/video/report/quiz/briefing/slides/infographic/mindmap/timeline), instructions
+- health: check NLM service binding status`,
     inputSchema: {
       type: "object",
       properties: {
-        prompt: { type: "string" },
-        drive_file_ids: { type: "array", items: { type: "string" } },
-        model: { type: "string", default: DEFAULT_MODEL },
-        system: { type: "string" },
+        action:        { type: "string", enum: ["ask","add_source","create_notebook","create_linked_doc","create_linked_sheet","append_doc","append_sheet","sync_all","generate_artifact","health"] },
+        notebook_id:   { type: "string" },
+        question:      { type: "string" },
+        url:           { type: "string" },
+        title:         { type: "string" },
+        content:       { type: "string" },
+        doc_id:        { type: "string" },
+        sheet_id:      { type: "string" },
+        rows:          { type: "array" },
+        source_id:     { type: "string" },
+        range:         { type: "string" },
+        artifact_type: { type: "string", enum: ["audio","video","report","quiz","briefing","slides","infographic","mindmap","timeline"] },
+        instructions:  { type: "string" },
+        text:          { type: "string" },
+        initial_data:  { type: "array" },
       },
-      required: ["prompt"],
+      required: ["action"],
     },
   },
 ];
 
-let _mcpSessions = {};
+async function proxyMCPList(binding, prefix) {
+  if (!binding) return [];
+  try {
+    const resp = await fetchWithRetry(binding, new Request("https://worker.internal/mcp", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+    }));
+    if (!resp.ok) return [];
+    const data = await resp.json();
+    const tools = data.result?.tools ?? [];
+    return tools.map(t => ({ ...t, name: prefix ? `${prefix}_${t.name}` : t.name }));
+  } catch { return []; }
+}
 
-async function handleMCPRequest(request, env, ctx) {
-  const method = request.method;
-  const url = new URL(request.url);
+async function proxyMCPCall(binding, toolName, args) {
+  if (!binding) return { error: "binding not configured" };
+  try {
+    const resp = await fetchWithRetry(binding, new Request("https://worker.internal/mcp", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: toolName, arguments: args } }),
+    }));
+    if (!resp.ok) return { error: `HTTP ${resp.status}` };
+    const data = await resp.json();
+    return data.result ?? data.error ?? data;
+  } catch (e) { return { error: e.message }; }
+}
 
-  // CORS
+async function getAllMCPTools(env) {
+  const [nlmTools, gwsTools] = await Promise.all([
+    proxyMCPList(env.NLM, "nlm"),
+    proxyMCPList(env.GWS, "gws"),
+  ]);
+  return [...OWN_MCP_TOOLS, ...nlmTools, ...gwsTools];
+}
+
+async function callOwnMCPTool(name, args, env) {
+  if (name === "gemini") {
+    const { action = "generate", ...rest } = args;
+    if (action === "generate") {
+      const resp = await handleGenerate(new Request("https://internal/generate", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(rest),
+      }), env);
+      const data = await resp.json();
+      return { content: [{ type: "text", text: JSON.stringify(data) }] };
+    }
+    if (action === "gems") {
+      const gemsResp = await handleGetGems(env);
+      const data = await gemsResp.json();
+      return { content: [{ type: "text", text: JSON.stringify(data) }] };
+    }
+  }
+  if (name === "nlm_workflow") {
+    const result = await handleNLM(new Request("https://internal/nlm", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(args),
+    }), env);
+    const data = await result.json();
+    return { content: [{ type: "text", text: JSON.stringify(data) }] };
+  }
+  return { content: [{ type: "text", text: `Unknown own tool: ${name}` }], isError: true };
+}
+
+let _mcpSessionId = null;
+
+async function handleMCP(request, env) {
+  const method = request.method.toUpperCase();
+
   if (method === "OPTIONS") {
-    return new Response(null, {
-      status: 204,
-      headers: {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization, Mcp-Session-Id",
-        "Access-Control-Expose-Headers": "Mcp-Session-Id",
-      },
+    return new Response(null, { status: 204, headers: corsHeaders() });
+  }
+  if (method === "DELETE") {
+    _mcpSessionId = null;
+    return new Response(null, { status: 204, headers: corsHeaders() });
+  }
+  if (method === "GET") {
+    return jsonResponse({
+      name: "gemini-webapi-worker",
+      version: "5.4.1",
+      transport: "streamable-http",
+      endpoint: `${new URL(request.url).origin}/mcp`,
+      tools: (await getAllMCPTools(env)).map(t => t.name),
     });
   }
 
-  const sessionId = request.headers.get("Mcp-Session-Id") || crypto.randomUUID();
-
-  if (method === "DELETE") {
-    delete _mcpSessions[sessionId];
-    return new Response(null, { status: 204, headers: { "Access-Control-Allow-Origin": "*" } });
-  }
-
-  let body = {};
-  try { body = await request.json(); } catch {}
+  let body;
+  try { body = await request.json(); }
+  catch { return jsonResponse({ jsonrpc: "2.0", error: { code: -32700, message: "Parse error" } }, 400); }
 
   const { jsonrpc, id, method: rpcMethod, params = {} } = body;
+  const sessionId = request.headers.get("Mcp-Session-Id") ?? (_mcpSessionId ??= crypto.randomUUID());
 
   let result;
-  switch (rpcMethod) {
-    case "initialize":
-      result = {
-        protocolVersion: "2024-11-05",
-        serverInfo: { name: "gemini-webapi-worker", version: "5.3.1" },
-        capabilities: { tools: {} },
-      };
-      break;
-    case "tools/list":
-      result = { tools: MCP_TOOLS };
-      break;
-    case "tools/call": {
-      const { name, arguments: args = {} } = params;
-      switch (name) {
-        case "gemini_generate": {
-          const resp = await handleGenerate(new Request("https://internal/generate", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(args),
-          }), env);
-          const data = await resp.json();
-          result = { content: [{ type: "text", text: JSON.stringify(data) }] };
-          break;
-        }
-        case "gemini_chat": {
-          const resp = await handleChat(new Request("https://internal/chat", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(args),
-          }), env);
-          const data = await resp.json();
-          result = { content: [{ type: "text", text: JSON.stringify(data) }] };
-          break;
-        }
-        case "workspace_action": {
-          const actionResult = await handleWorkspaceAction(env, args.action, args.params || {});
-          result = { content: [{ type: "text", text: JSON.stringify(actionResult) }] };
-          break;
-        }
-        case "gws_generate": {
-          const resp = await handleGenerate(new Request("https://internal/generate", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ ...args, notebooks: false }),
-          }), env);
-          const data = await resp.json();
-          result = { content: [{ type: "text", text: JSON.stringify(data) }] };
-          break;
-        }
-        default:
+  try {
+    switch (rpcMethod) {
+      case "initialize":
+        result = {
+          protocolVersion: "2025-03-26",
+          serverInfo: { name: "gemini-webapi-worker", version: "5.4.1" },
+          capabilities: { tools: {} },
+        };
+        break;
+      case "tools/list":
+        result = { tools: await getAllMCPTools(env) };
+        break;
+      case "tools/call": {
+        const { name, arguments: args = {} } = params;
+        const isOwn = OWN_MCP_TOOLS.some(t => t.name === name);
+        if (isOwn) {
+          result = await callOwnMCPTool(name, args, env);
+        } else if (name.startsWith("nlm_")) {
+          const proxied = await proxyMCPCall(env.NLM, name.slice(4), args);
+          result = { content: [{ type: "text", text: JSON.stringify(proxied) }] };
+        } else if (name.startsWith("gws_")) {
+          const proxied = await proxyMCPCall(env.GWS, name.slice(4), args);
+          result = { content: [{ type: "text", text: JSON.stringify(proxied) }] };
+        } else {
           result = { content: [{ type: "text", text: `Unknown tool: ${name}` }], isError: true };
+        }
+        break;
       }
-      break;
+      default:
+        return new Response(JSON.stringify({
+          jsonrpc: "2.0", id,
+          error: { code: -32601, message: "Method not found" },
+        }), { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders(), "Mcp-Session-Id": sessionId } });
     }
-    default:
-      return new Response(JSON.stringify({
-        jsonrpc: "2.0", id,
-        error: { code: -32601, message: "Method not found" },
-      }), { status: 200, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*", "Mcp-Session-Id": sessionId } });
+  } catch (e) {
+    return new Response(JSON.stringify({
+      jsonrpc: "2.0", id,
+      error: { code: -32603, message: e.message },
+    }), { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders(), "Mcp-Session-Id": sessionId } });
   }
 
   return new Response(JSON.stringify({ jsonrpc: "2.0", id, result }), {
     status: 200,
-    headers: {
-      "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": "*",
-      "Mcp-Session-Id": sessionId,
-    },
-  });
-}
-
-// ─── SSE MCP transport (legacy) ───────────────────────────────────────────────
-
-async function handleSSE(request, env, ctx) {
-  const sessionId = crypto.randomUUID();
-  const endpointUrl = `https://${new URL(request.url).hostname}/sse`;
-
-  const { readable, writable } = new TransformStream();
-  const writer = writable.getWriter();
-  const encoder = new TextEncoder();
-
-  ctx.waitUntil((async () => {
-    await writer.write(encoder.encode(`event: endpoint\ndata: ${endpointUrl}?sessionId=${sessionId}\n\n`));
-    // Keep-alive
-    const interval = setInterval(async () => {
-      try { await writer.write(encoder.encode(`: ping\n\n`)); } catch { clearInterval(interval); }
-    }, 15000);
-    // Store writer for POST messages
-    _mcpSessions[sessionId] = { writer, encoder, interval };
-  })());
-
-  return sseResponse(readable);
-}
-
-async function handleSSEMessage(request, env, ctx) {
-  const url = new URL(request.url);
-  const sessionId = url.searchParams.get("sessionId");
-  const session = _mcpSessions[sessionId];
-
-  let body = {};
-  try { body = await request.json(); } catch {}
-
-  const { jsonrpc, id, method: rpcMethod, params = {} } = body;
-
-  // Process same as MCP
-  const mockReq = new Request("https://internal/mcp", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", ...(sessionId ? { "Mcp-Session-Id": sessionId } : {}) },
-    body: JSON.stringify(body),
-  });
-  const resp = await handleMCPRequest(mockReq, env, ctx);
-  const data = await resp.json();
-
-  if (session) {
-    try {
-      await session.writer.write(session.encoder.encode(`event: message\ndata: ${JSON.stringify(data)}\n\n`));
-    } catch {}
-  }
-
-  return new Response(null, { status: 202, headers: { "Access-Control-Allow-Origin": "*" } });
-}
-
-// ─── Cookie push endpoints ────────────────────────────────────────────────────
-
-async function handleCookiePush(request, env, type) {
-  const authHeader = request.headers.get("Authorization") || "";
-  const token = authHeader.replace("Bearer ", "");
-  if (token !== env.SESSION_PUSH_KEY) {
-    return jsonResponse({ error: "Unauthorized" }, 401);
-  }
-  let body = {};
-  try { body = await request.json(); } catch {}
-  const { cookie, cookies } = body;
-  const value = cookie || cookies;
-  if (!value) return jsonResponse({ error: "cookie or cookies field required" }, 400);
-
-  _nlmCookies = typeof value === "string" ? value : JSON.stringify(value);
-
-  // Persist to KV if available
-  if (env.KV) {
-    await env.KV.put(`${type}_cookie`, _nlmCookies, { expirationTtl: 3600 * 24 });
-  }
-
-  return jsonResponse({ ok: true, type, updated: true });
-}
-
-// ─── Health endpoint ──────────────────────────────────────────────────────────
-
-async function handleHealth(env) {
-  const authMode = getAuthMode(env);
-  const hasNLM = !!env.NLM;
-  const hasGWS = !!env.GWS;
-  const hasHUB = !!env.HUB;
-  const hasCookie = !!(env.SECURE_1PSID || env.SESSION_KEY || _nlmCookies);
-
-  return jsonResponse({
-    status: "ok",
-    version: "5.3.1",
-    auth_mode: authMode || "none",
-    auth_mode_priority: "web-cookie > gemini-api > workers-ai",
-    bindings: {
-      NLM: hasNLM, GWS: hasGWS, HUB: hasHUB, AI: !!env.AI,
-      KV: !!env.KV, R2_AUTH: !!env.R2_AUTH, GOOGLE_AUTH: !!env.GOOGLE_AUTH,
-    },
-    features: {
-      grounding: hasNLM,
-      workspace: hasGWS,
-      streaming: authMode === "web-cookie" || authMode === "gemini-api",
-      chat: authMode === "web-cookie",
-      gems: hasCookie,
-    },
-    models: {
-      subscription: Object.keys(GEMINI_WEB_MODELS),
-      api_key: ["gemini-2.5-flash", "gemini-2.5-pro"],
-      default: DEFAULT_MODEL,
-    },
+    headers: { "Content-Type": "application/json", ...corsHeaders(), "Mcp-Session-Id": sessionId },
   });
 }
 
 // ─── Main router ──────────────────────────────────────────────────────────────
 
 export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    const path = url.pathname;
-    const method = request.method;
-
-    if (method === "OPTIONS") {
-      return new Response(null, {
-        status: 204,
-        headers: {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-          "Access-Control-Allow-Headers": "Authorization, Content-Type, Mcp-Session-Id",
-        },
-      });
-    }
-
-    // Auth check (skip push and cookie endpoints)
-    const skipAuth = ["/push", "/cookies/nlm", "/cookies/gemini", "/health", "/mcp", "/sse"].some(p => path.startsWith(p));
-    if (!skipAuth) {
-      const authHeader = request.headers.get("Authorization") || "";
-      const token = authHeader.replace("Bearer ", "");
-      if (env.SESSION_PUSH_KEY && token !== env.SESSION_PUSH_KEY) {
-        // Relaxed auth for generate endpoints — allow if cookies available
-        if (!["/generate", "/chat", "/stream", "/workspace", "/gems"].some(p => path.startsWith(p))) {
-          return jsonResponse({ error: "Unauthorized" }, 401);
-        }
-      }
-    }
-
+  async fetch(request, env) {
     try {
-      // ── MCP endpoints ───────────────────────────────────────────────────────
-      if (path === "/mcp") return handleMCPRequest(request, env, ctx);
-      if (path === "/sse" && method === "GET") return handleSSE(request, env, ctx);
-      if (path === "/sse" && method === "POST") return handleSSEMessage(request, env, ctx);
+      const url    = new URL(request.url);
+      const method = request.method.toUpperCase();
+      let path     = url.pathname;
+      // Normalize: strip /v1 prefix added by CF AI Gateway custom provider routing
+      if (path.startsWith("/v1/")) path = path.slice(3);
+      else if (path === "/v1") path = "/";
 
-      // ── Generate ────────────────────────────────────────────────────────────
-      if (path === "/generate" || path === "/generate/") return handleGenerate(request, env);
-      if (path === "/generate/stream") return handleStream(request, env);
-      if (path === "/stream") return handleStream(request, env);
-      if (path === "/chat") return handleChat(request, env);
+      if (method === "OPTIONS") return new Response(null, { headers: corsHeaders() });
 
-      // ── Gems ────────────────────────────────────────────────────────────────
-      if (path === "/gems" || path === "/gems/") return handleGems(request, env, null);
-      if (path.startsWith("/gems/")) return handleGems(request, env, path.slice(6));
-
-      // ── Workspace relay ─────────────────────────────────────────────────────
-      if (path === "/workspace/chat" || path === "/workspace") return handleWorkspaceChat(request, env);
-      if (path.startsWith("/workspace/action")) {
-        let body = {}; try { body = await request.json(); } catch {}
-        const result = await handleWorkspaceAction(env, body.action, body.params || {});
-        return jsonResponse(result);
-      }
-
-      // ── Cookie push ─────────────────────────────────────────────────────────
-      if (path === "/push") return handleCookiePush(request, env, "gemini");
-      if (path === "/cookies/nlm") return handleCookiePush(request, env, "nlm");
-      if (path === "/cookies/gemini") return handleCookiePush(request, env, "gemini");
-
-      // ── Health ──────────────────────────────────────────────────────────────
-      if (path === "/health") return handleHealth(env);
-
-      // ── Debug: auth mode ────────────────────────────────────────────────────
-      if (path === "/auth/mode") {
+      // Health
+      if (path === "/health" && method === "GET") {
         return jsonResponse({
-          auth_mode: getAuthMode(env),
-          auth_mode_priority: "web-cookie > gemini-api > workers-ai",
-          has_cookie: !!(env.SECURE_1PSID || env.SESSION_KEY || _nlmCookies),
-          has_api_key: !!env.GEMINI_API_KEY,
-          has_nlm: !!env.NLM,
-          has_google_auth: !!env.GOOGLE_AUTH,
+          status: "ok",
+          service: "gemini-webapi-worker",
+          version: "5.4.1",
+          auth_mode: getAuthMode(env) ?? "none",
+          auth_priority: "web-cookie (gemini-3-*) > workers-ai",
+          cookie_rotation: {
+            enabled: true,
+            cached_psidts: !!_cachedPSIDTS,
+            last_rotate: _lastRotateAt ? new Date(_lastRotateAt).toISOString() : null,
+          },
+          bindings: {
+            NLM: !!env.NLM, GWS: !!env.GWS, HUB: !!env.HUB,
+            AI: !!env.AI, KV: !!env.KV, R2_AUTH: !!env.R2_AUTH, GOOGLE_AUTH: !!env.GOOGLE_AUTH,
+          },
+          models: {
+            subscription: Object.keys(WEB_MODELS),
+            default: "gemini-3-flash",
+            note: "gemini-3-* subscription only — API key path removed",
+          },
+          mcp: {
+            endpoint: `${url.origin}/mcp`,
+            transport: "streamable-http",
+            spec: "2025-03-26",
+            own_tools: OWN_MCP_TOOLS.map(t => t.name),
+            proxied: "nlm_* and gws_* proxied from NLM/GWS bindings",
+          },
+          routes: [
+            "GET  /health",
+            "GET  /mcp | POST /mcp                  MCP Streamable HTTP",
+            "POST /generate                          Main generate",
+            "POST /generate/stream                   SSE streaming",
+            "GET  /gems | POST /gems | PUT/DELETE /gems/:id",
+            "POST /workspace/chat                    GWS relay",
+            "POST /workspace/run                     Agentic GWS execution",
+            "POST /workspace/execute                 Direct GWS tool call",
+            "POST /workspace/actions                 Batch GWS actions",
+            "POST /rotate                            Force cookie refresh",
+            "POST /cookies/update                    Push fresh cookies",
+            "POST /chat/completions                  OpenAI-compat",
+          ],
         });
       }
 
-      // ── Tools/call via REST (for MCP clients that prefer REST) ──────────────
-      if (path.startsWith("/tools/")) {
-        const toolName = path.slice(7);
-        let args = {}; try { args = await request.json(); } catch {}
-        const toolCallAuthToken = args.tcSaToken || env.GEMINI_API_KEY;
+      // MCP
+      if (path === "/mcp") return handleMCP(request, env);
 
-        switch (toolName) {
-          case "gemini_generate": {
-            const resp = await handleGenerate(new Request("https://internal/generate", {
-              method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(args),
-            }), env);
-            return resp;
-          }
-          case "gemini_chat": {
-            const resp = await handleChat(new Request("https://internal/chat", {
-              method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(args),
-            }), env);
-            return resp;
-          }
-          case "workspace_action": {
-            const result = await handleWorkspaceAction(env, args.action, args.params || {});
-            return jsonResponse(result);
-          }
-          default:
-            return jsonResponse({ error: `Unknown tool: ${toolName}` }, 404);
-        }
+      // Cookie management
+      if (path === "/rotate" && method === "POST") {
+        const cookie = await rotateCookies(env);
+        return jsonResponse({ ok: true, rotated: !!cookie });
       }
-
-      // ── OpenAI-compat chat completions ──────────────────────────────────────
-      if (path === "/v1/chat/completions") {
+      if (path === "/cookies/update" && method === "POST") {
         let body = {}; try { body = await request.json(); } catch {}
-        const { messages = [], model: reqModel = DEFAULT_MODEL, stream: streamReq = false } = body;
-        const lastUser = [...messages].reverse().find(m => m.role === "user");
-        const systemMsg = messages.find(m => m.role === "system");
-        if (!lastUser) return jsonResponse({ error: "No user message" }, 400);
-
-        const mappedModel = GEMINI_MODEL_MAP[reqModel] || reqModel;
-        const authMode = getAuthMode(env);
-        let result;
-
-        if (authMode === "web-cookie") {
-          result = await generateViaCookie(lastUser.content, env, { model: mappedModel, system: systemMsg?.content });
-        } else if (authMode === "gemini-api") {
-          result = await generateViaOfficialAPI(lastUser.content, env, { model: mappedModel });
-        } else {
-          return jsonResponse({ error: "No auth configured" }, 503);
+        const { cookies } = body;
+        if (cookies) {
+          _nlmCookies = cookies["__Secure-1PSID"] || cookies.SECURE_1PSID || Object.values(cookies)[0] || null;
+          _cachedPSIDTS = cookies["__Secure-1PSIDTS"] || null;
         }
-
-        return jsonResponse({
-          id: `chatcmpl-${Date.now()}`,
-          object: "chat.completion",
-          model: mappedModel,
-          choices: [{ index: 0, message: { role: "assistant", content: result.text }, finish_reason: "stop" }],
-          _gemini: { auth_mode: authMode, model: mappedModel },
-        });
+        if (env.KV && _nlmCookies) await env.KV.put("gemini_cookie", _nlmCookies, { expirationTtl: 86400 });
+        return jsonResponse({ ok: true });
       }
+
+      // Generate
+      if (path === "/generate") return handleGenerate(request, env);
+      if (path === "/generate/stream") return handleGenerateStream(request, env);
+
+      // Gems
+      if (path === "/gems") {
+        if (method === "GET")  return handleGetGems(env);
+        if (method === "POST") return handleCreateGem(request, env);
+      }
+      if (path.startsWith("/gems/")) {
+        const gemId = path.slice(6);
+        if (method === "PUT")    return handleUpdateGem(request, env, gemId);
+        if (method === "DELETE") return handleDeleteGem(request, env, gemId);
+      }
+
+      // Workspace
+      if (path === "/workspace/chat")    return handleWorkspaceChat(request, env);
+      if (path === "/workspace/run")     return handleWorkspaceRun(request, env);
+      if (path === "/workspace/execute") return handleWorkspaceExecute(request, env);
+      if (path === "/workspace/actions" || path === "/workspace/workflows") return handleGWS(request, env);
+
+      // NLM direct
+      if (path === "/nlm") return handleNLM(request, env);
+
+      // OpenAI compat
+      if (path === "/chat/completions") return handleOpenAICompletions(request, env);
 
       return jsonResponse({ error: "Not found", path }, 404);
     } catch (err) {
-      console.error("Worker error:", err);
+      console.error("Worker error:", err.stack ?? err.message);
       return jsonResponse({ error: "Internal server error", message: err.message }, 500);
     }
   },
