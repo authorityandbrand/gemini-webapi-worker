@@ -1,5 +1,34 @@
 # Changelog — gemini-webapi-worker
 
+## 2026-05-25: Fix model selection + SNlM0e wiring (critical)
+
+### Fixed
+- **Model selection had no effect.** `generateViaWebCookie` computed `webModel`
+  from `WEB_MODELS` but never sent it. `buildModelHeaders()` (the
+  `x-goog-ext-525001229-jspb` model selector) was never called, so every request
+  used the account-default model regardless of `model` / `task_type`. The model
+  id is now passed through `batchExecute()` and attached as a request header.
+- **SNlM0e token was never consumed.** batchexecute sent `at: ""` and
+  `getSessionData()` only fetched the SA bearer token — it never read the
+  `gemini_snlm0e` key that `scripts/push-session.py` seeds into the shared CACHE
+  namespace. From Cloudflare IPs this triggers Google's `/sorry` abuse page. New
+  `fetchSnlm0e()` reads `gemini_snlm0e` from `KV_CACHE` (falls back to `KV`) and
+  populates the `at` param. Cache is cleared on `/rotate`, `/cookies/update`, and
+  401/403 auth failures.
+
+### Added
+- `/health` `cookie_rotation.cached_snlm0e` flag for debugging the token path.
+
+### Still open (not addressed here)
+- Cookie read path (`fetchNLMCookies`) does not read the KV keys
+  `push-session.py` writes (`nlm:cookie_jar_v2` / `gemini_auth`); it relies on
+  the `GOOGLE_AUTH` / `NLM` bindings instead.
+- `AI_GATEWAY` binding is declared but `generateViaWorkersAI` does not route
+  through it; `gem`, `temperature`, and `max_tokens` are accepted but not applied.
+- Docs below this entry still reference the removed `GEMINI_API_KEY` path.
+
+---
+
 ## 2026-05-02: AI Gateway Binding, GEMINI_API_KEY Added, Secret Cleanup
 
 ### Added
