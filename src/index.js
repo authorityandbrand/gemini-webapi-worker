@@ -170,6 +170,7 @@ async function handleOpenAICompletions(request, env) {
 // ─── NLM cache ────────────────────────────────────────────────────────────────
 let _nlmCookies    = null;
 let _cachedPSIDTS  = null;
+let _cachedSnlm0e  = null;
 let _lastRotateAt  = null;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -248,9 +249,26 @@ async function fetchNLMCookies(env) {
 
 async function rotateCookies(env) {
   _cachedPSIDTS = null;
+  _cachedSnlm0e = null;
   _nlmCookies = null;
   _lastRotateAt = Date.now();
   return fetchNLMCookies(env);
+}
+
+// Reads the SNlM0e CSRF token seeded by scripts/push-session.py into the shared
+// CACHE namespace (KV_CACHE). batchexecute is rejected by Google's /sorry abuse
+// page from Cloudflare IPs without it. Stored as JSON: { snlm0e | value, ... }.
+async function fetchSnlm0e(env) {
+  if (_cachedSnlm0e) return _cachedSnlm0e;
+  const kv = env.KV_CACHE || env.KV;
+  if (!kv) return null;
+  try {
+    const raw = await kv.get("gemini_snlm0e");
+    if (!raw) return null;
+    const data = JSON.parse(raw);
+    _cachedSnlm0e = data.snlm0e || data.value || null;
+    return _cachedSnlm0e;
+  } catch { return null; }
 }
 
 function buildFullCookieString(baseCookie, psidts, psidcc) {
@@ -286,13 +304,14 @@ async function getSessionData(env, cookieStr) {
   return { saToken };
 }
 
-async function batchExecute(cookieStr, payload, env) {
+async function batchExecute(cookieStr, payload, env, modelId = null) {
   const { saToken } = await getSessionData(env, cookieStr);
   const headers = {
     "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
     "Cookie": cookieStr,
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "X-Goog-Authuser": "0",
+    ...(modelId ? buildModelHeaders(modelId) : {}),
     ...(saToken ? { "Authorization": `Bearer ${saToken}` } : {}),
   };
   const resp = await fetchWithRetry(
@@ -536,15 +555,17 @@ async function generateViaWebCookie(prompt, env, {
     temporary ? 1 : 0,
   ]);
 
+  const at = await fetchSnlm0e(env);
   const payload = new URLSearchParams({
     "f.req": JSON.stringify([[["CF5qKf", inner, null, "generic"]]]),
-    "at": "",
+    "at": at || "",
   }).toString();
 
-  const resp = await batchExecute(cookieStr, payload, env);
+  const resp = await batchExecute(cookieStr, payload, env, webModel.id);
   if (!resp.ok) {
     if (resp.status === 401 || resp.status === 403) {
       _nlmCookies = null;
+      _cachedSnlm0e = null;
       throw new Error(`Cookie auth failed (${resp.status}). Trigger a refresh via POST /rotate.`);
     }
     throw new Error(`Gemini web HTTP ${resp.status}`);
@@ -1059,6 +1080,7 @@ export default {
           cookie_rotation: {
             enabled: true,
             cached_psidts: !!_cachedPSIDTS,
+            cached_snlm0e: !!_cachedSnlm0e,
             last_rotate: _lastRotateAt ? new Date(_lastRotateAt).toISOString() : null,
           },
           bindings: {
@@ -1108,6 +1130,7 @@ export default {
         if (cookies) {
           _nlmCookies = cookies["__Secure-1PSID"] || cookies.SECURE_1PSID || Object.values(cookies)[0] || null;
           _cachedPSIDTS = cookies["__Secure-1PSIDTS"] || null;
+          _cachedSnlm0e = null;
         }
         if (env.KV && _nlmCookies) await env.KV.put("gemini_cookie", _nlmCookies, { expirationTtl: 86400 });
         return jsonResponse({ ok: true });
